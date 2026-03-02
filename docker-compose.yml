@@ -1,0 +1,17 @@
+services:
+  clawlite:
+    container_name: clawlite
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        APP_COMMIT: ${APP_COMMIT:-unknown}
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./data:/app/data
+      - ./openclaw-skills:/app/openclaw-skills:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["run", "--config", "/app/data/config.json"]

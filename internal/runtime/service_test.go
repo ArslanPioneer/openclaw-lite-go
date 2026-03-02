@@ -1,0 +1,435 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"openclaw-lite-go/internal/config"
+	"openclaw-lite-go/internal/telegram"
+	"openclaw-lite-go/internal/tools"
+)
+
+type fakeBot struct {
+	sent []sentMsg
+}
+
+type sentMsg struct {
+	chatID int64
+	text   string
+}
+
+func (f *fakeBot) GetUpdates(_ context.Context, _ int64, _ int) ([]telegram.Update, error) {
+	return nil, nil
+}
+
+func (f *fakeBot) SendMessage(_ context.Context, chatID int64, text string) error {
+	f.sent = append(f.sent, sentMsg{chatID: chatID, text: text})
+	return nil
+}
+
+type fakeAgent struct {
+	calls []agentCall
+	reply string
+}
+
+type agentCall struct {
+	text  string
+	model string
+}
+
+type fakeToolExecutor struct {
+	calls []string
+	run   func(callName string, query string) (string, error)
+}
+
+func (f *fakeToolExecutor) Execute(_ context.Context, call tools.Call) (string, error) {
+	f.calls = append(f.calls, call.Name+":"+call.Query)
+	if f.run != nil {
+		return f.run(call.Name, call.Query)
+	}
+	return "", fmt.Errorf("unexpected tool call")
+}
+
+func (f *fakeAgent) GenerateReply(_ context.Context, userText string, modelOverride string) (string, error) {
+	f.calls = append(f.calls, agentCall{text: userText, model: modelOverride})
+	if f.reply == "" {
+		return "default-reply", nil
+	}
+	return f.reply, nil
+}
+
+func TestHandleUpdateRoutesTextThroughAgentAndSendsReply(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "hello from agent"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "hi",
+		},
+	}
+
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+	if len(agent.calls) != 1 {
+		t.Fatalf("expected 1 agent call, got %d", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if bot.sent[0].text != "hello from agent" {
+		t.Fatalf("unexpected sent text: %q", bot.sent[0].text)
+	}
+}
+
+func TestHandleUpdateAgentCommandSwitchesModelPerChat(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "ok"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	setAgent := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/agent gpt-4.1-mini",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), setAgent); err != nil {
+		t.Fatalf("HandleUpdate(/agent) error = %v", err)
+	}
+
+	chat := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "what model?",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), chat); err != nil {
+		t.Fatalf("HandleUpdate(chat) error = %v", err)
+	}
+
+	if len(agent.calls) != 1 {
+		t.Fatalf("expected 1 agent call, got %d", len(agent.calls))
+	}
+	if agent.calls[0].model != "gpt-4.1-mini" {
+		t.Fatalf("expected model override gpt-4.1-mini, got %q", agent.calls[0].model)
+	}
+}
+
+type panicAgent struct{}
+
+func (p *panicAgent) GenerateReply(_ context.Context, _ string, _ string) (string, error) {
+	panic("boom")
+}
+
+func TestProcessUpdateRecoversPanic(t *testing.T) {
+	bot := &fakeBot{}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, &panicAgent{})
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "trigger panic",
+		},
+	}
+
+	err := svc.ProcessUpdate(context.Background(), update)
+	if err == nil {
+		t.Fatal("expected panic to be recovered as error")
+	}
+}
+
+func TestHandleUpdateSkillsCommandListsAvailableSkills(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "skills-source")
+	install := filepath.Join(tmp, "skills-install")
+	newsDir := filepath.Join(source, "daily-ai-news")
+	if err := os.MkdirAll(newsDir, 0o755); err != nil {
+		t.Fatalf("mkdir skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(newsDir, "SKILL.md"), []byte("daily-ai-news"), 0o644); err != nil {
+		t.Fatalf("write skill file: %v", err)
+	}
+
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			SkillsSourceDir:  source,
+			SkillsInstallDir: install,
+		},
+	}, bot, agent)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/skills",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate(/skills) error = %v", err)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected 0 agent calls for /skills, got %d", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if !strings.Contains(bot.sent[0].text, "daily-ai-news") {
+		t.Fatalf("unexpected /skills output: %q", bot.sent[0].text)
+	}
+}
+
+func TestHandleUpdateSkillsCommandSyncInstallsSkills(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "skills-source")
+	install := filepath.Join(tmp, "skills-install")
+
+	for _, name := range []string{"daily-ai-news", "news-aggregator-skill"} {
+		dir := filepath.Join(source, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(name), 0o644); err != nil {
+			t.Fatalf("write %s SKILL.md: %v", name, err)
+		}
+	}
+
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			SkillsSourceDir:  source,
+			SkillsInstallDir: install,
+		},
+	}, bot, agent)
+
+	syncUpdate := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/skills sync",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), syncUpdate); err != nil {
+		t.Fatalf("HandleUpdate(/skills sync) error = %v", err)
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message after sync, got %d", len(bot.sent))
+	}
+	if !strings.Contains(bot.sent[0].text, "Installed 2 skills") {
+		t.Fatalf("unexpected /skills sync output: %q", bot.sent[0].text)
+	}
+
+	installedUpdate := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/skills installed",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), installedUpdate); err != nil {
+		t.Fatalf("HandleUpdate(/skills installed) error = %v", err)
+	}
+	if len(bot.sent) != 2 {
+		t.Fatalf("expected 2 sent messages after installed query, got %d", len(bot.sent))
+	}
+	if !strings.Contains(bot.sent[1].text, "daily-ai-news") || !strings.Contains(bot.sent[1].text, "news-aggregator-skill") {
+		t.Fatalf("unexpected /skills installed output: %q", bot.sent[1].text)
+	}
+}
+
+func TestHandleUpdatePriceCommandUsage(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/price",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate(/price) error = %v", err)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected 0 agent calls for /price usage, got %d", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if !strings.Contains(bot.sent[0].text, "Usage: /price <ticker>") {
+		t.Fatalf("unexpected /price usage output: %q", bot.sent[0].text)
+	}
+}
+
+func TestHandleUpdateVersionCommand(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	originalVersion := AppVersion
+	originalCommit := AppCommit
+	t.Cleanup(func() {
+		AppVersion = originalVersion
+		AppCommit = originalCommit
+	})
+	AppVersion = "v9.9.9"
+	AppCommit = "deadbee"
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/version",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate(/version) error = %v", err)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected 0 agent calls for /version, got %d", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if bot.sent[0].text != "ClawLite version: v9.9.9 (deadbee)" {
+		t.Fatalf("unexpected /version output: %q", bot.sent[0].text)
+	}
+}
+
+func TestExtractTickerFromStockQuery(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{in: "nvda股价", want: "NVDA", ok: true},
+		{in: "what is NVDA stock price now", want: "NVDA", ok: true},
+		{in: "Tell me $TSLA price", want: "TSLA", ok: true},
+		{in: "just chatting about nvidia", want: "", ok: false},
+	}
+
+	for _, tc := range tests {
+		got, ok := extractTickerFromStockQuery(tc.in)
+		if ok != tc.ok || got != tc.want {
+			t.Fatalf("extractTickerFromStockQuery(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestHandleUpdateStockQueryFallsBackToWebSearch(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	toolsExec := &fakeToolExecutor{
+		run: func(callName string, query string) (string, error) {
+			switch callName {
+			case "stock_price":
+				return "", fmt.Errorf("stock source unavailable")
+			case "web_search":
+				if !strings.Contains(strings.ToLower(query), "nvda") {
+					t.Fatalf("unexpected web_search query: %q", query)
+				}
+				return "NVDA latest: 177.19 USD (from web_search)", nil
+			default:
+				return "", fmt.Errorf("unsupported tool call: %s", callName)
+			}
+		},
+	}
+	svc.tools = toolsExec
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "nvda股价",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected agent not to be called, got %d calls", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if !strings.Contains(bot.sent[0].text, "NVDA latest") {
+		t.Fatalf("unexpected sent message: %q", bot.sent[0].text)
+	}
+	if len(toolsExec.calls) != 2 || toolsExec.calls[0] != "stock_price:NVDA" || !strings.HasPrefix(toolsExec.calls[1], "web_search:") {
+		t.Fatalf("unexpected tool call sequence: %#v", toolsExec.calls)
+	}
+}
+
+func TestHandleUpdatePriceCommandFallsBackToWebSearch(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	toolsExec := &fakeToolExecutor{
+		run: func(callName string, query string) (string, error) {
+			switch callName {
+			case "stock_price":
+				return "", fmt.Errorf("rate limited")
+			case "web_search":
+				return "NVDA web quote fallback", nil
+			default:
+				return "", fmt.Errorf("unsupported tool call: %s", callName)
+			}
+		},
+	}
+	svc.tools = toolsExec
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/price NVDA",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected agent not to be called, got %d calls", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if bot.sent[0].text != "NVDA web quote fallback" {
+		t.Fatalf("unexpected sent message: %q", bot.sent[0].text)
+	}
+}

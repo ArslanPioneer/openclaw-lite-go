@@ -1,0 +1,26 @@
+{
+  "telegram": {
+    "bot_token": "123456:ABCDEF"
+  },
+  "agent": {
+    "provider": "openai",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "sk-xxxx",
+    "model": "gpt-4o-mini",
+    "system_prompt": "You are a concise assistant."
+  },
+  "runtime": {
+    "workers": 4,
+    "queue_size": 64,
+    "poll_timeout_second": 25,
+    "request_timeout_sec": 60,
+    "data_dir": "data",
+    "history_turns": 8,
+    "agent_retry_count": 2,
+    "skills_source_dir": "openclaw-skills",
+    "skills_install_dir": "data/skills",
+    "health_port": 18080,
+    "restart_backoff_ms": 1000,
+    "restart_max_ms": 30000
+  }
+}

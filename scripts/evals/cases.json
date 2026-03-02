@@ -1,0 +1,18 @@
+[
+  {
+    "name": "nvda_price_should_not_leak_parse_error",
+    "input": "nvda股价",
+    "expect_not_contains": [
+      "parse tool call",
+      "invalid character",
+      "agent request failed"
+    ]
+  },
+  {
+    "name": "docker_status_should_return_data_not_command_hint",
+    "input": "当前vps docker容器情况",
+    "expect_contains": [
+      "Name | State | Status | Image"
+    ]
+  }
+]
