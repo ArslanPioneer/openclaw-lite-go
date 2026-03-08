@@ -30,7 +30,7 @@ OpenClaw Lite is a minimal, Telegram-only assistant inspired by `openclaw/opencl
 ## Quick Start
 
 1. Create Telegram bot token from `@BotFather`.
-2. Prepare an OpenAI-compatible endpoint and API key.
+2. Prepare an OpenAI-compatible endpoint and API key if you want the legacy fallback path available.
 3. Run one-click setup:
 
 ```powershell
@@ -85,7 +85,7 @@ go run ./cmd/clawlite run --config ./config.json
 ## Telegram Commands
 
 - `/start`: startup hint
-- `/agent <model>`: switch model for current chat only
+- `/agent <model>`: switch the fallback legacy agent model for current chat only
 - `/codex [model|off]`: switch current chat to Codex model (`gpt-5-codex` by default)
 - `/agentmode <legacy|codex>`: switch the current chat between legacy agent flow and codex-first proxy flow
 - `/codexcli [on|off]`: compatibility alias for `/agentmode codex|legacy`
@@ -190,6 +190,7 @@ Then in Telegram:
 - `/codexcli on|off` remains available as a migration alias
 - current/latest questions trigger an explicit research prefetch so Codex can answer with sources
 - host-critical command text is risk-classified for audit/policy handling in full-access mode
+- if the Codex proxy is missing, the bot now asks for explicit `/agentmode legacy` instead of silently falling back
 
 ### Codex Proxy Deployment (Ubuntu + `codex login --device-auth`)
 

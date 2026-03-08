@@ -353,6 +353,38 @@ func TestHandleUpdateCanFallbackToLegacyAgentMode(t *testing.T) {
 	}
 }
 
+func TestLegacyAgentPathOnlyRunsWhenExplicitlyRequested(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexFirstDefault: true,
+		},
+	}, bot, agent)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 11},
+			Text: "inspect the deployment",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected legacy agent to stay idle, got %d calls", len(agent.calls))
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(bot.sent))
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[0].text), "/agentmode legacy") {
+		t.Fatalf("expected explicit fallback instruction, got %q", bot.sent[0].text)
+	}
+}
+
 type panicAgent struct{}
 
 func (p *panicAgent) GenerateReply(_ context.Context, _ string, _ string) (string, error) {

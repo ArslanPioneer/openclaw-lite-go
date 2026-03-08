@@ -89,13 +89,13 @@ func (c *Client) GenerateReply(ctx context.Context, userText string, modelOverri
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("agent request failed: %w", err)
+		return "", fmt.Errorf("legacy agent request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("agent returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return "", fmt.Errorf("legacy agent returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	var parsed chatCompletionResponse
@@ -103,12 +103,12 @@ func (c *Client) GenerateReply(ctx context.Context, userText string, modelOverri
 		return "", fmt.Errorf("decode response: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("empty choices in agent response")
+		return "", fmt.Errorf("empty choices in legacy agent response")
 	}
 
 	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if content == "" {
-		return "", fmt.Errorf("empty message content in agent response")
+		return "", fmt.Errorf("empty message content in legacy agent response")
 	}
 	return content, nil
 }

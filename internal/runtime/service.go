@@ -263,6 +263,12 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if s.isCodexPassThru(chatID) && s.codex != nil {
 		return s.handleCodexProxyChat(ctx, chatID, text)
 	}
+	if s.getExecutionMode(chatID) == executionModeCodex && s.codex == nil {
+		s.updateGoal(chatID, goal.ID, GoalResult{
+			Err: fmt.Errorf("codex proxy is not configured; switch to /agentmode legacy to use the fallback agent"),
+		})
+		return s.bot.SendMessage(ctx, chatID, "Codex execution mode is enabled, but the Codex proxy is not configured. Use /agentmode legacy to run the fallback agent explicitly.")
+	}
 	if ticker, ok := extractTickerFromStockQuery(text); ok {
 		stockReply, stockErr := s.lookupStockQuote(ctx, ticker)
 		if stockErr == nil {
