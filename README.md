@@ -89,6 +89,9 @@ go run ./cmd/clawlite run --config ./config.json
 - `/codex [model|off]`: switch current chat to Codex model (`gpt-5-codex` by default)
 - `/agentmode <legacy|codex>`: switch the current chat between legacy agent flow and codex-first proxy flow
 - `/codexcli [on|off]`: compatibility alias for `/agentmode codex|legacy`
+- `/goal`: show the active goal for the current chat
+- `/goals`: list recent goals for the current chat
+- `/goalstop`: stop the active goal for the current chat
 - `/price <ticker>`: direct stock quote (example: `/price NVDA`)
 - `/skills`: list installable skills from `runtime.skills_source_dir`
 - `/skills installed`: list installed skills from `runtime.skills_install_dir`

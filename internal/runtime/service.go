@@ -58,6 +58,7 @@ type Service struct {
 	health *HealthState
 	store  *memory.Store
 	sessions *SessionStore
+	goals *GoalStore
 	tools  ToolExecutor
 	skills *skills.Manager
 	codex  CodexProxy
@@ -88,6 +89,7 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 		agent:         agent,
 		store:         memStore,
 		sessions:      NewSessionStore(memStore.DataDir()),
+		goals:         NewGoalStore(memStore.DataDir()),
 		tools:         tools.NewExecutor(12*time.Second, skillManager),
 		skills:        skillManager,
 		codex:         codexProxy,
@@ -220,15 +222,32 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if strings.HasPrefix(text, "/price") {
 		return s.handlePriceCommand(ctx, chatID, text)
 	}
+	if strings.HasPrefix(text, "/goalstop") {
+		return s.handleGoalStopCommand(ctx, chatID)
+	}
+	if strings.HasPrefix(text, "/goals") {
+		return s.handleGoalsCommand(ctx, chatID)
+	}
+	if strings.HasPrefix(text, "/goal") {
+		return s.handleGoalCommand(ctx, chatID)
+	}
 	if strings.HasPrefix(text, "/skills") {
 		return s.handleSkillsCommand(ctx, chatID, text)
 	}
+
+	goal, err := s.createGoalFromMessage(chatID, text)
+	if err != nil {
+		return err
+	}
+	s.updateGoal(chatID, goal.ID, GoalResult{Running: true, Summary: "started"})
+
 	if s.isCodexPassThru(chatID) && s.codex != nil {
 		return s.handleCodexProxyChat(ctx, chatID, text)
 	}
 	if ticker, ok := extractTickerFromStockQuery(text); ok {
 		stockReply, stockErr := s.lookupStockQuote(ctx, ticker)
 		if stockErr == nil {
+			s.updateGoal(chatID, goal.ID, GoalResult{Done: true, Summary: stockReply})
 			if err := s.store.AppendExchange(chatID, text, stockReply); err != nil && s.health != nil {
 				s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
 			}
@@ -240,12 +259,14 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	prompt := s.buildPromptFromMemory(chatID, text)
 	reply, err := s.runAgentLoop(ctx, prompt, model)
 	if err != nil {
+		s.updateGoal(chatID, goal.ID, GoalResult{Err: err})
 		if s.health != nil {
 			s.health.RecordPollError(fmt.Errorf("agent loop failed: %w", err))
 		}
 		reply = s.recoverReplyWithoutExposingInternalError(ctx, prompt, model, err)
 	}
 	reply = s.repairNonActionableReply(ctx, prompt, model, text, reply)
+	s.updateGoal(chatID, goal.ID, GoalResult{Done: true, Summary: reply})
 
 	if err := s.store.AppendExchange(chatID, text, reply); err != nil && s.health != nil {
 		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
@@ -540,6 +561,7 @@ func (s *Service) handleCodexProxyChat(ctx context.Context, chatID int64, text s
 
 	reply, err := s.codex.Chat(ctx, chatID, text)
 	if err != nil {
+		s.updateActiveGoal(chatID, GoalResult{Err: err})
 		if s.health != nil {
 			s.health.RecordPollError(fmt.Errorf("codex proxy failed: %w", err))
 		}
@@ -549,6 +571,7 @@ func (s *Service) handleCodexProxyChat(ctx context.Context, chatID int64, text s
 	if reply == "" {
 		reply = "Codex proxy returned empty response."
 	}
+	s.updateActiveGoal(chatID, GoalResult{Done: true, Summary: reply})
 
 	if err := s.store.AppendExchange(chatID, text, reply); err != nil && s.health != nil {
 		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
@@ -721,6 +744,128 @@ func summarizeSessionText(text string, max int) string {
 		return trimmed
 	}
 	return strings.TrimSpace(trimmed[:max]) + "..."
+}
+
+func (s *Service) createGoalFromMessage(chatID int64, text string) (Goal, error) {
+	goal := NewGoal(chatID, text)
+	if err := s.goals.Save(goal); err != nil {
+		return Goal{}, err
+	}
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.ActiveGoalID = goal.ID
+		state.LastActivity = time.Now().UTC()
+	})
+	return goal, nil
+}
+
+func (s *Service) updateGoal(chatID int64, goalID string, result GoalResult) {
+	if s.goals == nil || strings.TrimSpace(goalID) == "" {
+		return
+	}
+	goal, err := s.goals.Load(chatID, goalID)
+	if err != nil {
+		if s.health != nil {
+			s.health.RecordPollError(fmt.Errorf("goal load failed: %w", err))
+		}
+		return
+	}
+	goal = ApplyGoalResult(goal, result)
+	if err := s.goals.Save(goal); err != nil && s.health != nil {
+		s.health.RecordPollError(fmt.Errorf("goal save failed: %w", err))
+	}
+}
+
+func (s *Service) updateActiveGoal(chatID int64, result GoalResult) {
+	if s.sessions == nil {
+		return
+	}
+	state, err := s.sessions.Load(chatID)
+	if err != nil {
+		if s.health != nil {
+			s.health.RecordPollError(fmt.Errorf("session load failed: %w", err))
+		}
+		return
+	}
+	s.updateGoal(chatID, state.ActiveGoalID, result)
+}
+
+func (s *Service) handleGoalCommand(ctx context.Context, chatID int64) error {
+	goal, err := s.loadActiveGoal(chatID)
+	if err != nil {
+		return s.bot.SendMessage(ctx, chatID, "No active goal for this chat.")
+	}
+	return s.bot.SendMessage(ctx, chatID, formatGoal(goal))
+}
+
+func (s *Service) handleGoalsCommand(ctx context.Context, chatID int64) error {
+	goals, err := s.goals.List(chatID)
+	if err != nil {
+		return s.bot.SendMessage(ctx, chatID, fmt.Sprintf("list goals failed: %v", err))
+	}
+	if len(goals) == 0 {
+		return s.bot.SendMessage(ctx, chatID, "No goals found for this chat.")
+	}
+	lines := make([]string, 0, min(5, len(goals))+1)
+	lines = append(lines, "Recent goals:")
+	for i, goal := range goals {
+		if i >= 5 {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("- [%s] %s (%s)", goal.Status, goal.Objective, goal.ID))
+	}
+	return s.bot.SendMessage(ctx, chatID, strings.Join(lines, "\n"))
+}
+
+func (s *Service) handleGoalStopCommand(ctx context.Context, chatID int64) error {
+	goal, err := s.loadActiveGoal(chatID)
+	if err != nil {
+		return s.bot.SendMessage(ctx, chatID, "No active goal to stop.")
+	}
+	goal = ApplyGoalResult(goal, GoalResult{Err: fmt.Errorf("stopped by user")})
+	if err := s.goals.Save(goal); err != nil {
+		return s.bot.SendMessage(ctx, chatID, fmt.Sprintf("stop goal failed: %v", err))
+	}
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.ActiveGoalID = ""
+		state.LastActivity = time.Now().UTC()
+	})
+	return s.bot.SendMessage(ctx, chatID, "Active goal stopped.")
+}
+
+func (s *Service) loadActiveGoal(chatID int64) (Goal, error) {
+	if s.sessions == nil || s.goals == nil {
+		return Goal{}, fmt.Errorf("goal storage unavailable")
+	}
+	state, err := s.sessions.Load(chatID)
+	if err != nil {
+		return Goal{}, err
+	}
+	if strings.TrimSpace(state.ActiveGoalID) == "" {
+		return Goal{}, fmt.Errorf("no active goal")
+	}
+	return s.goals.Load(chatID, state.ActiveGoalID)
+}
+
+func formatGoal(goal Goal) string {
+	lines := []string{
+		fmt.Sprintf("Goal: %s", goal.Objective),
+		fmt.Sprintf("ID: %s", goal.ID),
+		fmt.Sprintf("Status: %s", goal.Status),
+	}
+	if strings.TrimSpace(goal.LatestSummary) != "" {
+		lines = append(lines, "Latest: "+goal.LatestSummary)
+	}
+	if strings.TrimSpace(goal.LastError) != "" {
+		lines = append(lines, "Last error: "+goal.LastError)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Service) seenBefore(updateID int64) bool {
