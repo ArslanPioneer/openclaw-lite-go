@@ -213,6 +213,10 @@ func buildExecArgs(model string, prompt string, dangerFullAccess bool) []string 
 }
 
 func buildPrompt(turns []turn, message string, researchResults []tools.SearchResult) string {
+	if len(turns) == 0 && len(researchResults) == 0 && !needsExplicitResearch(message) {
+		return strings.TrimSpace(message)
+	}
+
 	lines := []string{
 		"You are continuing the same Telegram conversation.",
 		"Use prior context where it matters and answer the newest user message directly.",
