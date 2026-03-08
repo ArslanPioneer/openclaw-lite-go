@@ -1,0 +1,34 @@
+[
+  {
+    "name": "codex_first_service_health",
+    "mode": "codex_first",
+    "input": "inspect the clawlite service status on this vps",
+    "expect_contains": [
+      "healthy"
+    ]
+  },
+  {
+    "name": "codex_first_disk_usage",
+    "mode": "codex_first",
+    "input": "inspect disk usage on this vps",
+    "expect_contains": [
+      "disk"
+    ]
+  },
+  {
+    "name": "codex_first_latest_research",
+    "mode": "codex_first",
+    "input": "what is the latest ai news today?",
+    "expect_contains": [
+      "sources:"
+    ]
+  },
+  {
+    "name": "codex_first_repo_task",
+    "mode": "codex_first",
+    "input": "inspect this repo and complete a multi-step codex-first runtime review",
+    "expect_contains": [
+      "codex"
+    ]
+  }
+]

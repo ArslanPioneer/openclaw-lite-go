@@ -341,6 +341,7 @@ After deploy, config is generated at `./data/config.json`.
 
 - Unit/integration tests: `go test ./...`
 - Reliability eval gate: `go run ./scripts/evals/run.go -cases ./scripts/evals/cases.json`
+- Codex-first acceptance gate: `go run ./scripts/evals/run.go -cases ./scripts/evals/codex_first_cases.json`
   - Expected pass ratio: `>= 90%`
 - Benchmark smoke check: `go test ./internal/runtime -bench BenchmarkHandleUpdate -benchmem -run ^$`
   - Regression budget recommendation: `<= 15%` vs baseline

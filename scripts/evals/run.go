@@ -16,6 +16,7 @@ import (
 
 type evalCase struct {
 	Name              string   `json:"name"`
+	Mode              string   `json:"mode,omitempty"`
 	Input             string   `json:"input"`
 	ExpectContains    []string `json:"expect_contains"`
 	ExpectNotContains []string `json:"expect_not_contains"`
@@ -56,6 +57,8 @@ func (a *evalAgent) GenerateReply(_ context.Context, prompt string, _ string) (s
 
 type evalToolExecutor struct{}
 
+type evalCodexProxy struct{}
+
 func (e *evalToolExecutor) Execute(_ context.Context, call tools.Call) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(call.Name)) {
 	case "docker_ps":
@@ -66,6 +69,22 @@ func (e *evalToolExecutor) Execute(_ context.Context, call tools.Call) (string, 
 		return "Query: NVDA stock price latest\nSources:\n1. NVDA Quote\n   URL: https://example.com/nvda\n   Snippet: 177.19 USD", nil
 	default:
 		return "", fmt.Errorf("unsupported eval tool: %s", call.Name)
+	}
+}
+
+func (p *evalCodexProxy) Chat(_ context.Context, _ int64, message string) (string, error) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	switch {
+	case strings.Contains(lower, "service status") || strings.Contains(lower, "service health"):
+		return "ClawLite service is healthy. Codex auth present. Proxy reply correctness OK.", nil
+	case strings.Contains(lower, "disk usage"):
+		return "Disk usage: 42% used on / and 18% used on /var.", nil
+	case strings.Contains(lower, "latest") || strings.Contains(lower, "today") || strings.Contains(lower, "current"):
+		return "Latest AI news summary.\nSources:\n1. https://example.com/ai-news", nil
+	case strings.Contains(lower, "repo") || strings.Contains(lower, "multi-step"):
+		return "Codex-first runtime review complete. Codex goal completion ratio: 100%.", nil
+	default:
+		return "Codex-first eval handled the request.", nil
 	}
 }
 
@@ -135,7 +154,7 @@ func runCase(idx int, c evalCase) (string, error) {
 
 	bot := &evalBot{}
 	agent := &evalAgent{}
-	svc := runtime.NewService(config.Config{
+	cfg := config.Config{
 		Agent: config.AgentConfig{
 			Model: "gpt-4o-mini",
 		},
@@ -143,8 +162,16 @@ func runCase(idx int, c evalCase) (string, error) {
 			DataDir:      tmpDir,
 			HistoryTurns: 8,
 		},
-	}, bot, agent)
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Mode), "codex_first") {
+		cfg.Runtime.CodexFirstDefault = true
+		cfg.Runtime.CodexProxyURL = "http://127.0.0.1:8099/chat"
+	}
+	svc := runtime.NewService(cfg, bot, agent)
 	svc.SetToolExecutor(&evalToolExecutor{})
+	if strings.EqualFold(strings.TrimSpace(c.Mode), "codex_first") {
+		svc.SetCodexProxy(&evalCodexProxy{})
+	}
 
 	update := telegram.Update{
 		UpdateID: int64(idx + 1),
