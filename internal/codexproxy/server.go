@@ -2,7 +2,9 @@ package codexproxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -32,6 +34,8 @@ type Config struct {
 	DangerFullAccess bool
 	Executor         Executor
 	Researcher       Researcher
+	AuditLog         *AuditLog
+	Policy           Policy
 }
 
 type Executor interface {
@@ -46,6 +50,8 @@ type Server struct {
 	dangerFullAccess bool
 	exec             Executor
 	research         Researcher
+	audit            *AuditLog
+	policy           Policy
 }
 
 type request struct {
@@ -89,6 +95,11 @@ func NewServer(cfg Config) *Server {
 		dangerFullAccess: cfg.DangerFullAccess,
 		exec:             executor,
 		research:         cfg.Researcher,
+		audit:            cfg.AuditLog,
+		policy: Policy{
+			DangerFullAccess: cfg.DangerFullAccess || cfg.Policy.DangerFullAccess,
+			RequireConfirm:   cfg.Policy.RequireConfirm,
+		},
 	}
 }
 
@@ -149,25 +160,40 @@ func (s *Server) chat(ctx context.Context, chatID int64, message string) (string
 		return "", err
 	}
 
+	goalID, promptMessage := extractGoalID(message)
 	if s.research == nil {
 		s.research = NewResearcher(nil)
 	}
-	researchResults := s.runResearch(ctx, message)
-	prompt := buildPrompt(turns, message, researchResults)
+	if s.audit == nil {
+		s.audit = NewAuditLog(s.stateDir)
+	}
+	decision := s.policy.Evaluate(promptMessage)
+	if decision.RequiresConfirmation {
+		return "", fmt.Errorf("host-critical request requires explicit confirmation")
+	}
+	if !decision.Allowed {
+		return "", fmt.Errorf("request blocked by execution policy (%s)", decision.Risk)
+	}
+
+	researchResults := s.runResearch(ctx, promptMessage)
+	prompt := buildPrompt(turns, promptMessage, researchResults)
 	args := buildExecArgs(s.model, prompt, s.dangerFullAccess)
 	output, err := s.exec.Run(ctx, s.workdir, args)
 	if err != nil {
+		s.appendAuditRecord(chatID, goalID, message, prompt, "", s.executionMode())
 		return "", fmt.Errorf("codex exec failed: %w", err)
 	}
 	reply := parseReply(output)
 	if strings.TrimSpace(reply) == "" {
+		s.appendAuditRecord(chatID, goalID, message, prompt, "", s.executionMode())
 		return "", fmt.Errorf("codex returned empty reply")
 	}
 
-	turns = append(turns, turn{Role: "user", Content: message}, turn{Role: "assistant", Content: reply})
+	turns = append(turns, turn{Role: "user", Content: promptMessage}, turn{Role: "assistant", Content: reply})
 	if err := s.saveTurns(chatID, turns); err != nil {
 		return "", err
 	}
+	s.appendAuditRecord(chatID, goalID, message, prompt, reply, s.executionMode())
 	return reply, nil
 }
 
@@ -237,6 +263,48 @@ func (s *Server) runResearch(ctx context.Context, message string) []tools.Search
 		return nil
 	}
 	return results
+}
+
+func (s *Server) executionMode() string {
+	if s.dangerFullAccess {
+		return "danger-full-access"
+	}
+	return "full-auto"
+}
+
+func (s *Server) appendAuditRecord(chatID int64, goalID string, rawMessage string, prompt string, reply string, mode string) {
+	if s.audit == nil {
+		return
+	}
+	record := AuditRecord{
+		Timestamp:      time.Now().UTC(),
+		ChatID:         chatID,
+		GoalID:         strings.TrimSpace(goalID),
+		RawUserMessage: strings.TrimSpace(rawMessage),
+		PromptHash:     hashPrompt(prompt),
+		FinalReply:     strings.TrimSpace(reply),
+		ExecutionMode:  strings.TrimSpace(mode),
+	}
+	_ = s.audit.Append(record)
+}
+
+func hashPrompt(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(sum[:])
+}
+
+func extractGoalID(message string) (string, string) {
+	text := strings.TrimSpace(message)
+	if !strings.HasPrefix(text, "[goal:") {
+		return "", text
+	}
+	end := strings.Index(text, "]")
+	if end <= len("[goal:") {
+		return "", text
+	}
+	goalID := strings.TrimSpace(text[len("[goal:"):end])
+	rest := strings.TrimSpace(text[end+1:])
+	return goalID, rest
 }
 
 func parseReply(data []byte) string {
