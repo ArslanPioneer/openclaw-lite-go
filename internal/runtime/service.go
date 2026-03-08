@@ -21,6 +21,7 @@ const (
 	defaultMaxParseFailures      = 2
 	defaultMaxToolOutputChars    = 2400
 	defaultMaxOverflowRecoveries = 2
+	defaultCodexModel            = "gpt-5-codex"
 )
 
 var tickerPattern = regexp.MustCompile(`(?i)\$?[A-Z]{1,5}(?:\.[A-Z]{1,3})?`)
@@ -38,6 +39,10 @@ type ToolExecutor interface {
 	Execute(ctx context.Context, call tools.Call) (string, error)
 }
 
+type CodexProxy interface {
+	Chat(ctx context.Context, chatID int64, message string) (string, error)
+}
+
 type Service struct {
 	cfg    config.Config
 	bot    TelegramClient
@@ -47,9 +52,11 @@ type Service struct {
 	store  *memory.Store
 	tools  ToolExecutor
 	skills *skills.Manager
+	codex  CodexProxy
 
-	mu          sync.RWMutex
-	activeModel map[int64]string
+	mu            sync.RWMutex
+	activeModel   map[int64]string
+	codexPassThru map[int64]bool
 
 	dedupMu sync.Mutex
 	seen    map[int64]struct{}
@@ -58,15 +65,25 @@ type Service struct {
 func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Service {
 	cfg.ApplyDefaults()
 	skillManager := skills.NewManager(cfg.Runtime.SkillsSourceDir, cfg.Runtime.SkillsInstallDir)
+	var codexProxy CodexProxy
+	if strings.TrimSpace(cfg.Runtime.CodexProxyURL) != "" {
+		codexProxy = NewHTTPCodexProxy(
+			cfg.Runtime.CodexProxyURL,
+			cfg.Runtime.CodexProxyToken,
+			time.Duration(cfg.Runtime.CodexProxyTimeout)*time.Second,
+		)
+	}
 	return &Service{
-		cfg:         cfg,
-		bot:         bot,
-		agent:       agent,
-		store:       memory.NewStore(cfg.Runtime.DataDir, cfg.Runtime.HistoryTurns),
-		tools:       tools.NewExecutor(12*time.Second, skillManager),
-		skills:      skillManager,
-		activeModel: make(map[int64]string),
-		seen:        make(map[int64]struct{}),
+		cfg:           cfg,
+		bot:           bot,
+		agent:         agent,
+		store:         memory.NewStore(cfg.Runtime.DataDir, cfg.Runtime.HistoryTurns),
+		tools:         tools.NewExecutor(12*time.Second, skillManager),
+		skills:        skillManager,
+		codex:         codexProxy,
+		activeModel:   make(map[int64]string),
+		codexPassThru: make(map[int64]bool),
+		seen:          make(map[int64]struct{}),
 	}
 }
 
@@ -75,6 +92,10 @@ func (s *Service) SetToolExecutor(exec ToolExecutor) {
 		return
 	}
 	s.tools = exec
+}
+
+func (s *Service) SetCodexProxy(proxy CodexProxy) {
+	s.codex = proxy
 }
 
 func (s *Service) AttachHealthState(health *HealthState) {
@@ -168,7 +189,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 
 	chatID := msg.Chat.ID
 	if strings.HasPrefix(text, "/start") {
-		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
+		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /codex to switch to Codex model. Use /codexcli on to route chat to VPS Codex proxy. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
 	}
 	if strings.HasPrefix(text, "/version") {
 		return s.bot.SendMessage(ctx, chatID, "ClawLite version: "+BuildVersionString())
@@ -177,11 +198,20 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if strings.HasPrefix(text, "/agent") {
 		return s.handleAgentCommand(ctx, chatID, text)
 	}
+	if strings.HasPrefix(text, "/codexcli") {
+		return s.handleCodexCLICommand(ctx, chatID, text)
+	}
+	if strings.HasPrefix(text, "/codex") {
+		return s.handleCodexCommand(ctx, chatID, text)
+	}
 	if strings.HasPrefix(text, "/price") {
 		return s.handlePriceCommand(ctx, chatID, text)
 	}
 	if strings.HasPrefix(text, "/skills") {
 		return s.handleSkillsCommand(ctx, chatID, text)
+	}
+	if s.isCodexPassThru(chatID) {
+		return s.handleCodexProxyChat(ctx, chatID, text)
 	}
 	if ticker, ok := extractTickerFromStockQuery(text); ok {
 		stockReply, stockErr := s.lookupStockQuote(ctx, ticker)
@@ -427,6 +457,78 @@ func (s *Service) handleAgentCommand(ctx context.Context, chatID int64, text str
 	return s.bot.SendMessage(ctx, chatID, "Model switched to: "+model)
 }
 
+func (s *Service) handleCodexCommand(ctx context.Context, chatID int64, text string) error {
+	parts := strings.Fields(text)
+	if len(parts) > 1 && strings.EqualFold(strings.TrimSpace(parts[1]), "off") {
+		model := s.cfg.Agent.Model
+		s.mu.Lock()
+		s.activeModel[chatID] = model
+		s.mu.Unlock()
+		return s.bot.SendMessage(ctx, chatID, "Codex mode disabled. Model switched to: "+model)
+	}
+
+	model := defaultCodexModel
+	if len(parts) > 1 {
+		override := strings.TrimSpace(parts[1])
+		if override != "" {
+			model = override
+		}
+	}
+
+	s.mu.Lock()
+	s.activeModel[chatID] = model
+	s.mu.Unlock()
+	return s.bot.SendMessage(ctx, chatID, "Codex mode enabled. Model switched to: "+model)
+}
+
+func (s *Service) handleCodexCLICommand(ctx context.Context, chatID int64, text string) error {
+	parts := strings.Fields(strings.TrimSpace(text))
+	if len(parts) < 2 {
+		if s.isCodexPassThru(chatID) {
+			return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode is ON. Use /codexcli off to disable.")
+		}
+		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode is OFF. Use /codexcli on to enable.")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(parts[1])) {
+	case "on":
+		if s.codex == nil {
+			return s.bot.SendMessage(ctx, chatID, "Codex proxy is not configured. Set runtime.codex_proxy_url first.")
+		}
+		s.setCodexPassThru(chatID, true)
+		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode enabled for this chat.")
+	case "off":
+		s.setCodexPassThru(chatID, false)
+		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode disabled for this chat.")
+	default:
+		return s.bot.SendMessage(ctx, chatID, "Usage: /codexcli [on|off]")
+	}
+}
+
+func (s *Service) handleCodexProxyChat(ctx context.Context, chatID int64, text string) error {
+	if s.codex == nil {
+		s.setCodexPassThru(chatID, false)
+		return s.bot.SendMessage(ctx, chatID, "Codex proxy is not configured. Proxy mode has been turned off.")
+	}
+
+	reply, err := s.codex.Chat(ctx, chatID, text)
+	if err != nil {
+		if s.health != nil {
+			s.health.RecordPollError(fmt.Errorf("codex proxy failed: %w", err))
+		}
+		return s.bot.SendMessage(ctx, chatID, "Codex proxy request failed. Please retry.")
+	}
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		reply = "Codex proxy returned empty response."
+	}
+
+	if err := s.store.AppendExchange(chatID, text, reply); err != nil && s.health != nil {
+		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
+	}
+	return s.bot.SendMessage(ctx, chatID, reply)
+}
+
 func (s *Service) handleSkillsCommand(ctx context.Context, chatID int64, text string) error {
 	if s.skills == nil {
 		return s.bot.SendMessage(ctx, chatID, "skills manager is not configured")
@@ -505,6 +607,23 @@ func (s *Service) getActiveModel(chatID int64) string {
 		return model
 	}
 	return s.cfg.Agent.Model
+}
+
+func (s *Service) isCodexPassThru(chatID int64) bool {
+	s.mu.RLock()
+	enabled := s.codexPassThru[chatID]
+	s.mu.RUnlock()
+	return enabled
+}
+
+func (s *Service) setCodexPassThru(chatID int64, enabled bool) {
+	s.mu.Lock()
+	if enabled {
+		s.codexPassThru[chatID] = true
+	} else {
+		delete(s.codexPassThru, chatID)
+	}
+	s.mu.Unlock()
 }
 
 func (s *Service) seenBefore(updateID int64) bool {

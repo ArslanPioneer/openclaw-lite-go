@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ const (
 	defaultDataDir           = "data"
 	defaultHistoryTurns      = 8
 	defaultAgentRetryCount   = 2
+	defaultCodexProxyTimeout = 120
 )
 
 const (
@@ -59,6 +61,9 @@ type RuntimeConfig struct {
 	AgentRetryCount   int    `json:"agent_retry_count,omitempty"`
 	SkillsSourceDir   string `json:"skills_source_dir,omitempty"`
 	SkillsInstallDir  string `json:"skills_install_dir,omitempty"`
+	CodexProxyURL     string `json:"codex_proxy_url,omitempty"`
+	CodexProxyToken   string `json:"codex_proxy_token,omitempty"`
+	CodexProxyTimeout int    `json:"codex_proxy_timeout_sec,omitempty"`
 }
 
 const defaultTaskSystemPrompt = `You are ClawLite, a pragmatic task assistant.
@@ -133,6 +138,9 @@ func (c *Config) ApplyDefaults() {
 	if strings.TrimSpace(c.Runtime.SkillsSourceDir) == "" {
 		c.Runtime.SkillsSourceDir = "openclaw-skills"
 	}
+	if c.Runtime.CodexProxyTimeout <= 0 {
+		c.Runtime.CodexProxyTimeout = defaultCodexProxyTimeout
+	}
 }
 
 func (c Config) Validate() error {
@@ -179,6 +187,15 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Runtime.SkillsInstallDir) == "" {
 		return fmt.Errorf("invalid config: runtime.skills_install_dir is required")
+	}
+	if c.Runtime.CodexProxyTimeout <= 0 {
+		return fmt.Errorf("invalid config: runtime.codex_proxy_timeout_sec must be > 0")
+	}
+	if proxyURL := strings.TrimSpace(c.Runtime.CodexProxyURL); proxyURL != "" {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+			return fmt.Errorf("invalid config: runtime.codex_proxy_url must be a valid http/https url")
+		}
 	}
 	return nil
 }

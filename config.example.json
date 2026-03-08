@@ -19,6 +19,9 @@
     "agent_retry_count": 2,
     "skills_source_dir": "openclaw-skills",
     "skills_install_dir": "data/skills",
+    "codex_proxy_url": "http://127.0.0.1:8099/chat",
+    "codex_proxy_token": "replace-with-random-secret",
+    "codex_proxy_timeout_sec": 600,
     "health_port": 18080,
     "restart_backoff_ms": 1000,
     "restart_max_ms": 30000

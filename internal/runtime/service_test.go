@@ -36,6 +36,17 @@ type fakeAgent struct {
 	reply string
 }
 
+type fakeCodexProxy struct {
+	calls []codexProxyCall
+	reply string
+	err   error
+}
+
+type codexProxyCall struct {
+	chatID  int64
+	message string
+}
+
 type agentCall struct {
 	text  string
 	model string
@@ -58,6 +69,17 @@ func (f *fakeAgent) GenerateReply(_ context.Context, userText string, modelOverr
 	f.calls = append(f.calls, agentCall{text: userText, model: modelOverride})
 	if f.reply == "" {
 		return "default-reply", nil
+	}
+	return f.reply, nil
+}
+
+func (f *fakeCodexProxy) Chat(_ context.Context, chatID int64, message string) (string, error) {
+	f.calls = append(f.calls, codexProxyCall{
+		chatID:  chatID,
+		message: message,
+	})
+	if f.err != nil {
+		return "", f.err
 	}
 	return f.reply, nil
 }
@@ -125,6 +147,128 @@ func TestHandleUpdateAgentCommandSwitchesModelPerChat(t *testing.T) {
 	}
 	if agent.calls[0].model != "gpt-4.1-mini" {
 		t.Fatalf("expected model override gpt-4.1-mini, got %q", agent.calls[0].model)
+	}
+}
+
+func TestHandleUpdateCodexCommandSwitchesModelPerChat(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "ok"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	setCodex := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "/codex",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), setCodex); err != nil {
+		t.Fatalf("HandleUpdate(/codex) error = %v", err)
+	}
+
+	chat := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 42},
+			Text: "hello codex",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), chat); err != nil {
+		t.Fatalf("HandleUpdate(chat) error = %v", err)
+	}
+
+	if len(agent.calls) != 1 {
+		t.Fatalf("expected 1 agent call, got %d", len(agent.calls))
+	}
+	if agent.calls[0].model != "gpt-5-codex" {
+		t.Fatalf("expected model override gpt-5-codex, got %q", agent.calls[0].model)
+	}
+}
+
+func TestHandleUpdateCodexCLIProxyModeRoutesMessagesToProxy(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "codex proxy reply"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL: "http://127.0.0.1:8099/chat",
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	enable := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 7},
+			Text: "/codexcli on",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), enable); err != nil {
+		t.Fatalf("HandleUpdate(/codexcli on) error = %v", err)
+	}
+
+	chat := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 7},
+			Text: "please refactor this function",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), chat); err != nil {
+		t.Fatalf("HandleUpdate(chat) error = %v", err)
+	}
+
+	if len(proxy.calls) != 1 {
+		t.Fatalf("expected 1 codex proxy call, got %d", len(proxy.calls))
+	}
+	if proxy.calls[0].message != "please refactor this function" {
+		t.Fatalf("unexpected proxy message: %q", proxy.calls[0].message)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected agent to be bypassed, got %d calls", len(agent.calls))
+	}
+	if got := bot.sent[len(bot.sent)-1].text; got != "codex proxy reply" {
+		t.Fatalf("unexpected bot reply: %q", got)
+	}
+}
+
+func TestHandleUpdateCodexCLIOnRequiresConfiguredProxy(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "normal-agent-reply"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+	}, bot, agent)
+
+	enable := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 8},
+			Text: "/codexcli on",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), enable); err != nil {
+		t.Fatalf("HandleUpdate(/codexcli on) error = %v", err)
+	}
+
+	if len(bot.sent) != 1 || !strings.Contains(strings.ToLower(bot.sent[0].text), "not configured") {
+		t.Fatalf("expected not configured message, got %+v", bot.sent)
+	}
+
+	chat := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 8},
+			Text: "hello",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), chat); err != nil {
+		t.Fatalf("HandleUpdate(chat) error = %v", err)
+	}
+	if len(agent.calls) != 1 {
+		t.Fatalf("expected normal agent call, got %d", len(agent.calls))
 	}
 }
 

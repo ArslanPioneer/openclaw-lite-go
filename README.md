@@ -13,11 +13,13 @@ OpenClaw Lite is a minimal, Telegram-only assistant inspired by `openclaw/opencl
 ## Project Layout
 
 - `cmd/clawlite/main.go`: CLI entry (`setup`, `run`)
+- `cmd/codexproxy/main.go`: VPS-side Codex CLI HTTP proxy (`/chat`)
 - `internal/config`: config load/save/validate
 - `internal/telegram`: Telegram Bot API client (long polling + send)
 - `internal/agent`: OpenAI-compatible chat completion adapter
 - `internal/memory`: per-chat persistent memory with summary compaction
 - `internal/runtime`: worker-pool runtime and command handling
+- `internal/codexproxy`: Codex CLI proxy server and transcript state
 - `internal/tools`: minimal built-in tool executor (`web_search`, `http_get`, `echo`, `skill_*`)
 - `internal/skills`: install/read/run manager for skill directories (`SKILL.md` + `scripts/*`)
 - `scripts/quickstart.ps1`: one-click setup script
@@ -84,6 +86,8 @@ go run ./cmd/clawlite run --config ./config.json
 
 - `/start`: startup hint
 - `/agent <model>`: switch model for current chat only
+- `/codex [model|off]`: switch current chat to Codex model (`gpt-5-codex` by default)
+- `/codexcli [on|off]`: route chat messages to configured Codex Proxy endpoint on VPS
 - `/price <ticker>`: direct stock quote (example: `/price NVDA`)
 - `/skills`: list installable skills from `runtime.skills_source_dir`
 - `/skills installed`: list installed skills from `runtime.skills_install_dir`
@@ -158,6 +162,107 @@ TOOL_CALL {"name":"skill_run","skill":"news-aggregator-skill","script":"scripts/
 TOOL_CALL {"name":"docker_ps"}
 TOOL_CALL {"name":"docker_ps","all":true}
 TOOL_CALL {"name":"stock_price","query":"NVDA"}
+```
+
+### Codex Proxy Mode (VPS Middleware)
+
+If you run a Codex middleware service on VPS, configure:
+
+```json
+"runtime": {
+  "codex_proxy_url": "http://127.0.0.1:8099/chat",
+  "codex_proxy_token": "",
+  "codex_proxy_timeout_sec": 120
+}
+```
+
+Then in Telegram:
+- `/codexcli on` to route normal chat messages to the Codex middleware
+- `/codexcli off` to return to normal agent flow
+
+### Codex Proxy Deployment (Ubuntu + `codex login --device-auth`)
+
+The bot already knows how to POST to a Codex proxy. The missing piece on VPS is `cmd/codexproxy`, which wraps the local Codex CLI and keeps a per-chat transcript under `.codexproxy/`.
+
+1. Install Node.js LTS and Codex CLI on the VPS:
+
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates build-essential
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm i -g @openai/codex
+codex login --device-auth
+```
+
+2. Build both binaries inside the deployed repo:
+
+```bash
+cd /opt/openclaw-lite-go
+go build -o bin/clawlite ./cmd/clawlite
+go build -o bin/codexproxy ./cmd/codexproxy
+```
+
+3. Start the Codex proxy locally on the VPS:
+
+```bash
+cd /opt/openclaw-lite-go
+./bin/codexproxy \
+  --listen 127.0.0.1:8099 \
+  --workdir /opt/openclaw-lite-go \
+  --state-dir /opt/openclaw-lite-go/.codexproxy \
+  --codex-bin codex \
+  --token "replace-with-random-secret"
+```
+
+If you want Telegram messages to let Codex act as a full VPS operator instead of a sandboxed repo agent, add:
+
+```bash
+  --danger-full-access
+```
+
+This makes `codexproxy` pass `--dangerously-bypass-approvals-and-sandbox` to `codex exec`. Only use it on a VPS you are willing to trust with unrestricted command execution.
+
+4. Point `config.json` at the local proxy:
+
+```json
+"runtime": {
+  "codex_proxy_url": "http://127.0.0.1:8099/chat",
+  "codex_proxy_token": "replace-with-random-secret",
+  "codex_proxy_timeout_sec": 600
+}
+```
+
+5. Run the bot and toggle Telegram chat passthrough:
+
+```bash
+cd /opt/openclaw-lite-go
+./bin/clawlite run --config ./config.json
+```
+
+Then in Telegram:
+- `/codexcli on`
+- send a normal message
+- `/codexcli off` to return to the OpenAI-compatible agent path
+
+Example `systemd` unit for `codexproxy`:
+
+```ini
+[Unit]
+Description=OpenClaw Codex Proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openclaw-lite-go
+ExecStart=/opt/openclaw-lite-go/bin/codexproxy --listen 127.0.0.1:8099 --workdir /opt/openclaw-lite-go --state-dir /opt/openclaw-lite-go/.codexproxy --codex-bin codex --token replace-with-random-secret --danger-full-access
+Restart=always
+RestartSec=3
+User=root
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## Docker One-Click Deploy
