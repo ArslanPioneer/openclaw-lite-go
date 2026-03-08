@@ -59,6 +59,7 @@ type Service struct {
 	store  *memory.Store
 	sessions *SessionStore
 	goals *GoalStore
+	runner *GoalRunner
 	tools  ToolExecutor
 	skills *skills.Manager
 	codex  CodexProxy
@@ -112,11 +113,29 @@ func (s *Service) SetCodexProxy(proxy CodexProxy) {
 
 func (s *Service) AttachHealthState(health *HealthState) {
 	s.health = health
+	if s.runner != nil {
+		s.runner.SetHealthState(health)
+	}
+}
+
+func (s *Service) SetGoalRunner(runner *GoalRunner) {
+	s.runner = runner
+	if s.runner != nil && s.health != nil {
+		s.runner.SetHealthState(s.health)
+	}
 }
 
 func (s *Service) Run(ctx context.Context) error {
 	updates := make(chan telegram.Update, s.cfg.Runtime.QueueSize)
 	var wg sync.WaitGroup
+
+	if s.runner != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.runner.Run(ctx)
+		}()
+	}
 
 	for i := 0; i < s.cfg.Runtime.Workers; i++ {
 		wg.Add(1)
