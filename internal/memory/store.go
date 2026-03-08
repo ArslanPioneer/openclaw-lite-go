@@ -39,6 +39,10 @@ func NewStore(dataDir string, maxTurns int) *Store {
 	}
 }
 
+func (s *Store) DataDir() string {
+	return filepath.Dir(s.baseDir)
+}
+
 func (s *Store) Load(chatID int64) (ChatState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

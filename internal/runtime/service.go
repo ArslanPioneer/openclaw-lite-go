@@ -57,6 +57,7 @@ type Service struct {
 	offset int64
 	health *HealthState
 	store  *memory.Store
+	sessions *SessionStore
 	tools  ToolExecutor
 	skills *skills.Manager
 	codex  CodexProxy
@@ -72,6 +73,7 @@ type Service struct {
 func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Service {
 	cfg.ApplyDefaults()
 	skillManager := skills.NewManager(cfg.Runtime.SkillsSourceDir, cfg.Runtime.SkillsInstallDir)
+	memStore := memory.NewStore(cfg.Runtime.DataDir, cfg.Runtime.HistoryTurns)
 	var codexProxy CodexProxy
 	if strings.TrimSpace(cfg.Runtime.CodexProxyURL) != "" {
 		codexProxy = NewHTTPCodexProxy(
@@ -84,7 +86,8 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 		cfg:           cfg,
 		bot:           bot,
 		agent:         agent,
-		store:         memory.NewStore(cfg.Runtime.DataDir, cfg.Runtime.HistoryTurns),
+		store:         memStore,
+		sessions:      NewSessionStore(memStore.DataDir()),
 		tools:         tools.NewExecutor(12*time.Second, skillManager),
 		skills:        skillManager,
 		codex:         codexProxy,
@@ -247,6 +250,9 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if err := s.store.AppendExchange(chatID, text, reply); err != nil && s.health != nil {
 		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
 	}
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.LastActivity = time.Now().UTC()
+	})
 	return s.bot.SendMessage(ctx, chatID, reply)
 }
 
@@ -547,6 +553,11 @@ func (s *Service) handleCodexProxyChat(ctx context.Context, chatID int64, text s
 	if err := s.store.AppendExchange(chatID, text, reply); err != nil && s.health != nil {
 		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
 	}
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.ExecutionMode = string(executionModeCodex)
+		state.LastCodexResultSummary = summarizeSessionText(reply, 240)
+		state.LastActivity = time.Now().UTC()
+	})
 	return s.bot.SendMessage(ctx, chatID, reply)
 }
 
@@ -649,6 +660,17 @@ func (s *Service) getExecutionMode(chatID int64) executionMode {
 	if ok {
 		return mode
 	}
+	if s.sessions != nil {
+		state, err := s.sessions.Load(chatID)
+		if err != nil {
+			if s.health != nil {
+				s.health.RecordPollError(fmt.Errorf("session load failed: %w", err))
+			}
+		} else if persistedMode, ok := parseExecutionMode(state.ExecutionMode); ok {
+			s.setExecutionMode(chatID, persistedMode)
+			return persistedMode
+		}
+	}
 	if s.cfg.Runtime.CodexFirstDefault {
 		return executionModeCodex
 	}
@@ -659,6 +681,10 @@ func (s *Service) setExecutionMode(chatID int64, mode executionMode) {
 	s.mu.Lock()
 	s.chatMode[chatID] = mode
 	s.mu.Unlock()
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.ExecutionMode = string(mode)
+		state.LastActivity = time.Now().UTC()
+	})
 }
 
 func (s *Service) setChatExecutionMode(ctx context.Context, chatID int64, mode executionMode, successMessage string) error {
@@ -667,6 +693,34 @@ func (s *Service) setChatExecutionMode(ctx context.Context, chatID int64, mode e
 	}
 	s.setExecutionMode(chatID, mode)
 	return s.bot.SendMessage(ctx, chatID, successMessage)
+}
+
+func (s *Service) recordSessionActivity(chatID int64, apply func(*SessionState)) {
+	if s.sessions == nil {
+		return
+	}
+	if err := s.sessions.Update(chatID, apply); err != nil && s.health != nil {
+		s.health.RecordPollError(fmt.Errorf("session update failed: %w", err))
+	}
+}
+
+func parseExecutionMode(raw string) (executionMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(executionModeLegacy):
+		return executionModeLegacy, true
+	case string(executionModeCodex):
+		return executionModeCodex, true
+	default:
+		return "", false
+	}
+}
+
+func summarizeSessionText(text string, max int) string {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= max {
+		return trimmed
+	}
+	return strings.TrimSpace(trimmed[:max]) + "..."
 }
 
 func (s *Service) seenBefore(updateID int64) bool {
