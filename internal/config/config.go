@@ -64,6 +64,7 @@ type RuntimeConfig struct {
 	CodexProxyURL     string `json:"codex_proxy_url,omitempty"`
 	CodexProxyToken   string `json:"codex_proxy_token,omitempty"`
 	CodexProxyTimeout int    `json:"codex_proxy_timeout_sec,omitempty"`
+	CodexFirstDefault bool   `json:"codex_first_default,omitempty"`
 }
 
 const defaultTaskSystemPrompt = `You are ClawLite, a pragmatic task assistant.

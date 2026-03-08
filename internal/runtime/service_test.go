@@ -272,6 +272,87 @@ func TestHandleUpdateCodexCLIOnRequiresConfiguredProxy(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateCodexFirstRoutesNormalChatToCodexProxyByDefault(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "codex default reply"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:      "http://127.0.0.1:8099/chat",
+			CodexFirstDefault:  true,
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 9},
+			Text: "check the deployment health",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(proxy.calls) != 1 {
+		t.Fatalf("expected 1 codex proxy call, got %d", len(proxy.calls))
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected agent to be bypassed, got %d calls", len(agent.calls))
+	}
+	if got := bot.sent[len(bot.sent)-1].text; got != "codex default reply" {
+		t.Fatalf("unexpected bot reply: %q", got)
+	}
+}
+
+func TestHandleUpdateCanFallbackToLegacyAgentMode(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "legacy agent reply"}
+	proxy := &fakeCodexProxy{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	switchMode := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 10},
+			Text: "/agentmode legacy",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), switchMode); err != nil {
+		t.Fatalf("HandleUpdate(/agentmode legacy) error = %v", err)
+	}
+
+	update := telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 10},
+			Text: "say hello",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate(chat) error = %v", err)
+	}
+
+	if len(agent.calls) != 1 {
+		t.Fatalf("expected 1 agent call, got %d", len(agent.calls))
+	}
+	if len(proxy.calls) != 0 {
+		t.Fatalf("expected codex proxy to be bypassed, got %d calls", len(proxy.calls))
+	}
+	if got := bot.sent[len(bot.sent)-1].text; got != "legacy agent reply" {
+		t.Fatalf("unexpected bot reply: %q", got)
+	}
+}
+
 type panicAgent struct{}
 
 func (p *panicAgent) GenerateReply(_ context.Context, _ string, _ string) (string, error) {

@@ -24,6 +24,13 @@ const (
 	defaultCodexModel            = "gpt-5-codex"
 )
 
+type executionMode string
+
+const (
+	executionModeLegacy executionMode = "legacy"
+	executionModeCodex  executionMode = "codex"
+)
+
 var tickerPattern = regexp.MustCompile(`(?i)\$?[A-Z]{1,5}(?:\.[A-Z]{1,3})?`)
 
 type TelegramClient interface {
@@ -56,7 +63,7 @@ type Service struct {
 
 	mu            sync.RWMutex
 	activeModel   map[int64]string
-	codexPassThru map[int64]bool
+	chatMode      map[int64]executionMode
 
 	dedupMu sync.Mutex
 	seen    map[int64]struct{}
@@ -82,7 +89,7 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 		skills:        skillManager,
 		codex:         codexProxy,
 		activeModel:   make(map[int64]string),
-		codexPassThru: make(map[int64]bool),
+		chatMode:      make(map[int64]executionMode),
 		seen:          make(map[int64]struct{}),
 	}
 }
@@ -189,12 +196,15 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 
 	chatID := msg.Chat.ID
 	if strings.HasPrefix(text, "/start") {
-		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /codex to switch to Codex model. Use /codexcli on to route chat to VPS Codex proxy. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
+		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /codex to switch to Codex model. Use /agentmode legacy|codex to switch execution mode. Use /codexcli on|off as a compatibility alias. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
 	}
 	if strings.HasPrefix(text, "/version") {
 		return s.bot.SendMessage(ctx, chatID, "ClawLite version: "+BuildVersionString())
 	}
 
+	if strings.HasPrefix(text, "/agentmode") {
+		return s.handleAgentModeCommand(ctx, chatID, text)
+	}
 	if strings.HasPrefix(text, "/agent") {
 		return s.handleAgentCommand(ctx, chatID, text)
 	}
@@ -210,7 +220,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if strings.HasPrefix(text, "/skills") {
 		return s.handleSkillsCommand(ctx, chatID, text)
 	}
-	if s.isCodexPassThru(chatID) {
+	if s.isCodexPassThru(chatID) && s.codex != nil {
 		return s.handleCodexProxyChat(ctx, chatID, text)
 	}
 	if ticker, ok := extractTickerFromStockQuery(text); ok {
@@ -485,23 +495,34 @@ func (s *Service) handleCodexCLICommand(ctx context.Context, chatID int64, text 
 	parts := strings.Fields(strings.TrimSpace(text))
 	if len(parts) < 2 {
 		if s.isCodexPassThru(chatID) {
-			return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode is ON. Use /codexcli off to disable.")
+			return s.bot.SendMessage(ctx, chatID, "Codex execution mode is ON. Use /agentmode legacy or /codexcli off to disable.")
 		}
-		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode is OFF. Use /codexcli on to enable.")
+		return s.bot.SendMessage(ctx, chatID, "Codex execution mode is OFF. Use /agentmode codex or /codexcli on to enable.")
 	}
 
 	switch strings.ToLower(strings.TrimSpace(parts[1])) {
 	case "on":
-		if s.codex == nil {
-			return s.bot.SendMessage(ctx, chatID, "Codex proxy is not configured. Set runtime.codex_proxy_url first.")
-		}
-		s.setCodexPassThru(chatID, true)
-		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode enabled for this chat.")
+		return s.setChatExecutionMode(ctx, chatID, executionModeCodex, "Codex execution mode enabled for this chat.")
 	case "off":
-		s.setCodexPassThru(chatID, false)
-		return s.bot.SendMessage(ctx, chatID, "Codex CLI proxy mode disabled for this chat.")
+		return s.setChatExecutionMode(ctx, chatID, executionModeLegacy, "Legacy agent mode enabled for this chat.")
 	default:
 		return s.bot.SendMessage(ctx, chatID, "Usage: /codexcli [on|off]")
+	}
+}
+
+func (s *Service) handleAgentModeCommand(ctx context.Context, chatID int64, text string) error {
+	parts := strings.Fields(strings.TrimSpace(text))
+	if len(parts) < 2 {
+		return s.bot.SendMessage(ctx, chatID, "Usage: /agentmode <legacy|codex>\nCurrent mode: "+string(s.getExecutionMode(chatID)))
+	}
+
+	switch strings.ToLower(strings.TrimSpace(parts[1])) {
+	case string(executionModeLegacy):
+		return s.setChatExecutionMode(ctx, chatID, executionModeLegacy, "Legacy agent mode enabled for this chat.")
+	case string(executionModeCodex):
+		return s.setChatExecutionMode(ctx, chatID, executionModeCodex, "Codex execution mode enabled for this chat.")
+	default:
+		return s.bot.SendMessage(ctx, chatID, "Usage: /agentmode <legacy|codex>")
 	}
 }
 
@@ -610,20 +631,42 @@ func (s *Service) getActiveModel(chatID int64) string {
 }
 
 func (s *Service) isCodexPassThru(chatID int64) bool {
-	s.mu.RLock()
-	enabled := s.codexPassThru[chatID]
-	s.mu.RUnlock()
-	return enabled
+	return s.getExecutionMode(chatID) == executionModeCodex
 }
 
 func (s *Service) setCodexPassThru(chatID int64, enabled bool) {
-	s.mu.Lock()
+	mode := executionModeLegacy
 	if enabled {
-		s.codexPassThru[chatID] = true
-	} else {
-		delete(s.codexPassThru, chatID)
+		mode = executionModeCodex
 	}
+	s.setExecutionMode(chatID, mode)
+}
+
+func (s *Service) getExecutionMode(chatID int64) executionMode {
+	s.mu.RLock()
+	mode, ok := s.chatMode[chatID]
+	s.mu.RUnlock()
+	if ok {
+		return mode
+	}
+	if s.cfg.Runtime.CodexFirstDefault {
+		return executionModeCodex
+	}
+	return executionModeLegacy
+}
+
+func (s *Service) setExecutionMode(chatID int64, mode executionMode) {
+	s.mu.Lock()
+	s.chatMode[chatID] = mode
 	s.mu.Unlock()
+}
+
+func (s *Service) setChatExecutionMode(ctx context.Context, chatID int64, mode executionMode, successMessage string) error {
+	if mode == executionModeCodex && s.codex == nil {
+		return s.bot.SendMessage(ctx, chatID, "Codex proxy is not configured. Set runtime.codex_proxy_url first.")
+	}
+	s.setExecutionMode(chatID, mode)
+	return s.bot.SendMessage(ctx, chatID, successMessage)
 }
 
 func (s *Service) seenBefore(updateID int64) bool {

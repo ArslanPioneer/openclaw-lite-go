@@ -87,7 +87,8 @@ go run ./cmd/clawlite run --config ./config.json
 - `/start`: startup hint
 - `/agent <model>`: switch model for current chat only
 - `/codex [model|off]`: switch current chat to Codex model (`gpt-5-codex` by default)
-- `/codexcli [on|off]`: route chat messages to configured Codex Proxy endpoint on VPS
+- `/agentmode <legacy|codex>`: switch the current chat between legacy agent flow and codex-first proxy flow
+- `/codexcli [on|off]`: compatibility alias for `/agentmode codex|legacy`
 - `/price <ticker>`: direct stock quote (example: `/price NVDA`)
 - `/skills`: list installable skills from `runtime.skills_source_dir`
 - `/skills installed`: list installed skills from `runtime.skills_install_dir`
@@ -172,13 +173,16 @@ If you run a Codex middleware service on VPS, configure:
 "runtime": {
   "codex_proxy_url": "http://127.0.0.1:8099/chat",
   "codex_proxy_token": "",
-  "codex_proxy_timeout_sec": 120
+  "codex_proxy_timeout_sec": 120,
+  "codex_first_default": true
 }
 ```
 
 Then in Telegram:
-- `/codexcli on` to route normal chat messages to the Codex middleware
-- `/codexcli off` to return to normal agent flow
+- normal chat messages route to the Codex middleware by default
+- `/agentmode legacy` to return one chat to the legacy agent path
+- `/agentmode codex` to switch that chat back to codex-first mode
+- `/codexcli on|off` remains available as a migration alias
 
 ### Codex Proxy Deployment (Ubuntu + `codex login --device-auth`)
 
@@ -229,7 +233,8 @@ This makes `codexproxy` pass `--dangerously-bypass-approvals-and-sandbox` to `co
 "runtime": {
   "codex_proxy_url": "http://127.0.0.1:8099/chat",
   "codex_proxy_token": "replace-with-random-secret",
-  "codex_proxy_timeout_sec": 600
+  "codex_proxy_timeout_sec": 600,
+  "codex_first_default": true
 }
 ```
 
@@ -241,9 +246,9 @@ cd /opt/openclaw-lite-go
 ```
 
 Then in Telegram:
-- `/codexcli on`
 - send a normal message
-- `/codexcli off` to return to the OpenAI-compatible agent path
+- `/agentmode legacy` to return that chat to the OpenAI-compatible agent path
+- `/agentmode codex` or `/codexcli on` to switch it back
 
 Example `systemd` unit for `codexproxy`:
 
