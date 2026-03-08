@@ -107,6 +107,7 @@ go run ./cmd/clawlite run --config ./config.json
 - Task-oriented default system prompt with tool-call convention.
 - Multi-step agent loop: supports iterative `plan -> tool -> reflect -> next tool/final answer` flow (bounded loop).
 - OpenClaw skills bridge: install/list/read/run skills from configured runtime directories.
+- Codex proxy research path: time-sensitive prompts can prefetch citeable web sources before Codex answers.
 
 Tool call format (model -> runtime):
 
@@ -186,6 +187,7 @@ Then in Telegram:
 - `/agentmode legacy` to return one chat to the legacy agent path
 - `/agentmode codex` to switch that chat back to codex-first mode
 - `/codexcli on|off` remains available as a migration alias
+- current/latest questions trigger an explicit research prefetch so Codex can answer with sources
 
 ### Codex Proxy Deployment (Ubuntu + `codex login --device-auth`)
 

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"openclaw-lite-go/internal/tools"
 )
 
 const (
@@ -29,6 +31,7 @@ type Config struct {
 	Timeout          time.Duration
 	DangerFullAccess bool
 	Executor         Executor
+	Researcher       Researcher
 }
 
 type Executor interface {
@@ -42,6 +45,7 @@ type Server struct {
 	model            string
 	dangerFullAccess bool
 	exec             Executor
+	research         Researcher
 }
 
 type request struct {
@@ -84,6 +88,7 @@ func NewServer(cfg Config) *Server {
 		model:            strings.TrimSpace(cfg.Model),
 		dangerFullAccess: cfg.DangerFullAccess,
 		exec:             executor,
+		research:         cfg.Researcher,
 	}
 }
 
@@ -144,7 +149,11 @@ func (s *Server) chat(ctx context.Context, chatID int64, message string) (string
 		return "", err
 	}
 
-	prompt := buildPrompt(turns, message)
+	if s.research == nil {
+		s.research = NewResearcher(nil)
+	}
+	researchResults := s.runResearch(ctx, message)
+	prompt := buildPrompt(turns, message, researchResults)
 	args := buildExecArgs(s.model, prompt, s.dangerFullAccess)
 	output, err := s.exec.Run(ctx, s.workdir, args)
 	if err != nil {
@@ -177,27 +186,39 @@ func buildExecArgs(model string, prompt string, dangerFullAccess bool) []string 
 	return args
 }
 
-func buildPrompt(turns []turn, message string) string {
-	if len(turns) == 0 {
-		return strings.TrimSpace(message)
-	}
-
-	trimmed := turns
-	if len(trimmed) > maxTurnsKept {
-		trimmed = trimmed[len(trimmed)-maxTurnsKept:]
-	}
+func buildPrompt(turns []turn, message string, researchResults []tools.SearchResult) string {
 	lines := []string{
 		"You are continuing the same Telegram conversation.",
 		"Use prior context where it matters and answer the newest user message directly.",
-		"",
-		"Conversation so far:",
 	}
-	for _, item := range trimmed {
-		role := "User"
-		if strings.EqualFold(strings.TrimSpace(item.Role), "assistant") {
-			role = "Assistant"
+	if needsExplicitResearch(message) {
+		lines = append(lines,
+			"For current/latest/time-sensitive facts, use the explicit research path first and include sources in the final answer.",
+		)
+	}
+	if len(researchResults) > 0 {
+		lines = append(lines, "", "Research context:")
+		for i, result := range researchResults {
+			lines = append(lines, fmt.Sprintf("%d. %s", i+1, strings.TrimSpace(result.Title)))
+			lines = append(lines, "   URL: "+strings.TrimSpace(result.URL))
+			if strings.TrimSpace(result.Snippet) != "" {
+				lines = append(lines, "   Snippet: "+strings.TrimSpace(result.Snippet))
+			}
 		}
-		lines = append(lines, role+": "+strings.TrimSpace(item.Content))
+	}
+	if len(turns) > 0 {
+		trimmed := turns
+		if len(trimmed) > maxTurnsKept {
+			trimmed = trimmed[len(trimmed)-maxTurnsKept:]
+		}
+		lines = append(lines, "", "Conversation so far:")
+		for _, item := range trimmed {
+			role := "User"
+			if strings.EqualFold(strings.TrimSpace(item.Role), "assistant") {
+				role = "Assistant"
+			}
+			lines = append(lines, role+": "+strings.TrimSpace(item.Content))
+		}
 	}
 	lines = append(lines, "", "New user message:", strings.TrimSpace(message))
 	prompt := strings.Join(lines, "\n")
@@ -205,6 +226,17 @@ func buildPrompt(turns []turn, message string) string {
 		return prompt
 	}
 	return prompt[len(prompt)-maxPromptChars:]
+}
+
+func (s *Server) runResearch(ctx context.Context, message string) []tools.SearchResult {
+	if s.research == nil || !needsExplicitResearch(message) {
+		return nil
+	}
+	results, err := s.research.Research(ctx, message, 7, 5)
+	if err != nil {
+		return nil
+	}
+	return results
 }
 
 func parseReply(data []byte) string {

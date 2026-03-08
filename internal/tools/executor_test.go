@@ -299,3 +299,41 @@ func TestExecutorWebSearchAppliesRecencyAndMaxResults(t *testing.T) {
 		t.Fatalf("expected max_results=1 to limit output, got %q", output)
 	}
 }
+
+func TestExecutorResearchReturnsStructuredSources(t *testing.T) {
+	encoded := url.QueryEscape("https://example.com/openclaw-release")
+	htmlBody := fmt.Sprintf(`<html><body>
+<a class="result__a" href="https://duckduckgo.com/l/?uddg=%s">OpenClaw Release Notes</a>
+<div class="result__snippet">Release summary with reliability updates.</div>
+</body></html>`, encoded)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(htmlBody))
+	}))
+	defer server.Close()
+
+	executor := NewExecutor(2*time.Second, nil)
+	executor.webSearchHTMLURL = server.URL + "/html/"
+
+	results, err := executor.WebSearchResults(context.Background(), Call{
+		Name:       "web_search",
+		Query:      "openclaw reliability",
+		MaxResults: 1,
+	})
+	if err != nil {
+		t.Fatalf("WebSearchResults() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Title != "OpenClaw Release Notes" {
+		t.Fatalf("Title = %q", results[0].Title)
+	}
+	if results[0].URL != "https://example.com/openclaw-release" {
+		t.Fatalf("URL = %q", results[0].URL)
+	}
+	if !strings.Contains(results[0].Snippet, "reliability updates") {
+		t.Fatalf("Snippet = %q", results[0].Snippet)
+	}
+}

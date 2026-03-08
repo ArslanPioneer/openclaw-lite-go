@@ -55,6 +55,12 @@ type Executor struct {
 	webSearchHTMLURL      string
 }
 
+type SearchResult struct {
+	Title   string
+	URL     string
+	Snippet string
+}
+
 func NewExecutor(timeout time.Duration, skillManager *skills.Manager) *Executor {
 	return &Executor{
 		httpClient: &http.Client{
@@ -338,9 +344,35 @@ func sanitizeTicker(raw string) (string, error) {
 }
 
 func (e *Executor) webSearch(ctx context.Context, call Call) (string, error) {
+	results, err := e.WebSearchResults(ctx, call)
+	if err != nil {
+		return "", err
+	}
+	if len(results) == 0 {
+		return "No citeable search sources found.", nil
+	}
+
+	query := strings.TrimSpace(call.Query)
+	lines := make([]string, 0, 2+len(results)*3)
+	lines = append(lines, "Query: "+query)
+	if call.RecencyDays > 0 {
+		lines = append(lines, fmt.Sprintf("Freshness: last %d day(s)", call.RecencyDays))
+	}
+	lines = append(lines, "Sources:")
+	for i, result := range results {
+		lines = append(lines, fmt.Sprintf("%d. %s", i+1, result.Title))
+		lines = append(lines, "   URL: "+result.URL)
+		if result.Snippet != "" {
+			lines = append(lines, "   Snippet: "+clipString(result.Snippet, 280))
+		}
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func (e *Executor) WebSearchResults(ctx context.Context, call Call) ([]SearchResult, error) {
 	query := strings.TrimSpace(call.Query)
 	if query == "" {
-		return "", fmt.Errorf("web_search query is required")
+		return nil, fmt.Errorf("web_search query is required")
 	}
 
 	maxResults := call.MaxResults
@@ -369,60 +401,36 @@ func (e *Executor) webSearch(ctx context.Context, call Call) (string, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("build web_search request: %w", err)
+		return nil, fmt.Errorf("build web_search request: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; OpenClawLite/1.0)")
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("web_search request failed: %w", err)
+		return nil, fmt.Errorf("web_search request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("web_search status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return nil, fmt.Errorf("web_search status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		return "", fmt.Errorf("read web_search response: %w", err)
+		return nil, fmt.Errorf("read web_search response: %w", err)
 	}
 
-	results := extractSearchResults(string(data), maxResults)
-	if len(results) == 0 {
-		return "No citeable search sources found.", nil
-	}
-
-	lines := make([]string, 0, 2+len(results)*3)
-	lines = append(lines, "Query: "+query)
-	if call.RecencyDays > 0 {
-		lines = append(lines, fmt.Sprintf("Freshness: last %d day(s)", call.RecencyDays))
-	}
-	lines = append(lines, "Sources:")
-	for i, result := range results {
-		lines = append(lines, fmt.Sprintf("%d. %s", i+1, result.Title))
-		lines = append(lines, "   URL: "+result.URL)
-		if result.Snippet != "" {
-			lines = append(lines, "   Snippet: "+clipString(result.Snippet, 280))
-		}
-	}
-	return strings.Join(lines, "\n"), nil
+	return extractSearchResults(string(data), maxResults), nil
 }
 
-type searchResult struct {
-	Title   string
-	URL     string
-	Snippet string
-}
-
-func extractSearchResults(payload string, maxResults int) []searchResult {
+func extractSearchResults(payload string, maxResults int) []SearchResult {
 	matches := resultAnchorPattern.FindAllStringSubmatchIndex(payload, -1)
 	if len(matches) == 0 {
 		return nil
 	}
 
-	results := make([]searchResult, 0, maxResults)
+	results := make([]SearchResult, 0, maxResults)
 	for i, match := range matches {
 		if len(match) < 6 {
 			continue
@@ -452,7 +460,7 @@ func extractSearchResults(payload string, maxResults int) []searchResult {
 			}
 		}
 
-		results = append(results, searchResult{
+		results = append(results, SearchResult{
 			Title:   title,
 			URL:     urlText,
 			Snippet: snippet,
