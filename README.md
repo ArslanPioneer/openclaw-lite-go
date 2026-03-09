@@ -328,6 +328,24 @@ PULL_CODE=true ./scripts/docker-update.sh
 
 After deploy, config is generated at `./data/config.json`.
 
+## GitHub Auto Deploy
+
+This repo includes a GitHub Actions workflow at `.github/workflows/deploy-vps.yml`.
+It runs on every push to `main` (and supports manual trigger), executes `go test ./...`,
+then deploys to VPS over SSH by pulling the latest `main` and running Docker Compose.
+
+Required repository secrets:
+- `VPS_HOST`
+- `VPS_PORT`
+- `VPS_USER`
+- `VPS_PASSWORD`
+
+Deployment behavior:
+- If `/opt/openclaw-lite-go` is not a git repo, it backs up the old directory and clones from GitHub.
+- Preserves `data/` and `.codexproxy/` from backup when recreating directory.
+- Stops/disables legacy `openclaw-lite-go.service` to avoid host port `18080` conflicts.
+- Runs `docker compose up -d --build --remove-orphans --force-recreate`.
+
 ## Performance Notes
 
 - Single binary design (no plugin runtime)

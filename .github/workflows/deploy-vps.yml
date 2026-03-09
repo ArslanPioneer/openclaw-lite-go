@@ -1,0 +1,78 @@
+name: Deploy VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps-main
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Deploy Over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT }}
+          script_stop: true
+          command_timeout: 40m
+          script: |
+            set -euo pipefail
+
+            REPO_DIR="/opt/openclaw-lite-go"
+            REPO_URL="https://github.com/ArslanPioneer/openclaw-lite-go.git"
+            BRANCH="main"
+            BACKUP=""
+
+            if [ ! -d "${REPO_DIR}/.git" ]; then
+              BACKUP="${REPO_DIR}.backup.$(date -u +%Y%m%d%H%M%S)"
+              if [ -d "${REPO_DIR}" ]; then
+                mv "${REPO_DIR}" "${BACKUP}"
+              fi
+              git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${REPO_DIR}"
+              if [ -n "${BACKUP}" ] && [ -d "${BACKUP}/data" ]; then
+                mkdir -p "${REPO_DIR}/data"
+                cp -a "${BACKUP}/data/." "${REPO_DIR}/data/"
+              fi
+              if [ -n "${BACKUP}" ] && [ -d "${BACKUP}/.codexproxy" ]; then
+                mkdir -p "${REPO_DIR}/.codexproxy"
+                cp -a "${BACKUP}/.codexproxy/." "${REPO_DIR}/.codexproxy/"
+              fi
+            else
+              git -C "${REPO_DIR}" fetch origin "${BRANCH}"
+              git -C "${REPO_DIR}" checkout "${BRANCH}"
+              git -C "${REPO_DIR}" reset --hard "origin/${BRANCH}"
+            fi
+
+            if systemctl list-unit-files | grep -q '^openclaw-lite-go.service'; then
+              systemctl stop openclaw-lite-go.service || true
+              systemctl disable openclaw-lite-go.service || true
+            fi
+
+            cd "${REPO_DIR}"
+            export APP_VERSION="$(date -u +%Y%m%d.%H%M%S)"
+            export APP_COMMIT="$(git rev-parse --short HEAD)"
+
+            docker compose up -d --build --remove-orphans --force-recreate
+            docker compose ps
+            docker compose logs clawlite --tail=120
