@@ -66,12 +66,49 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSecond int
 }
 
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
+	markdownPayload := map[string]any{
+		"chat_id":    chatID,
+		"text":       escapeMarkdownV2(text),
+		"parse_mode": "MarkdownV2",
+	}
+	var ignored map[string]any
+	err := c.call(ctx, "sendMessage", markdownPayload, &ignored)
+	if err == nil {
+		return nil
+	}
+	if !isMarkdownEntityParseError(err) {
+		return err
+	}
+
 	payload := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
 	}
-	var ignored map[string]any
 	return c.call(ctx, "sendMessage", payload, &ignored)
+}
+
+func isMarkdownEntityParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(lower, "parse entities")
+}
+
+func escapeMarkdownV2(text string) string {
+	if text == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(text) + 8)
+	for _, r := range text {
+		switch r {
+		case '\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func (c *Client) call(ctx context.Context, method string, payload any, out any) error {

@@ -100,6 +100,8 @@ go run ./cmd/clawlite run --config ./config.json
 - `/skills install <skill_name>`: install one skill by name
 - `/version`: show deployed build version and commit
 
+Telegram replies are sent with `MarkdownV2` parse mode by default; if Telegram rejects markdown entities, the bot retries once as plain text automatically.
+
 ## Intelligent Minimum Pack
 
 - Persistent chat memory (file-based): per-chat history stored in `runtime.data_dir`.
