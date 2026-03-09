@@ -299,8 +299,8 @@ func TestHandleUpdateCodexFirstRoutesNormalChatToCodexProxyByDefault(t *testing.
 	svc := NewService(config.Config{
 		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
 		Runtime: config.RuntimeConfig{
-			CodexProxyURL:      "http://127.0.0.1:8099/chat",
-			CodexFirstDefault:  true,
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
 		},
 	}, bot, agent)
 	svc.SetCodexProxy(proxy)
@@ -592,6 +592,108 @@ func TestHandleUpdateCodexProxyRequestCarriesGoalMarker(t *testing.T) {
 	}
 	if !strings.Contains(proxy.calls[0].message, "inspect host status") {
 		t.Fatalf("expected original objective in proxy message, got %q", proxy.calls[0].message)
+	}
+}
+
+func TestHandleUpdateHostCriticalCodexRequestRequiresExplicitConfirm(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "should-not-be-called"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+			DataDir:           t.TempDir(),
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	if err := svc.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 120},
+			Text: "run rm -rf /tmp/test-cache",
+		},
+	}); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(proxy.calls) != 0 {
+		t.Fatalf("expected host-critical request to pause before proxy execution, got %d calls", len(proxy.calls))
+	}
+	if len(bot.sent) != 1 || !strings.Contains(strings.ToLower(bot.sent[0].text), "/confirm") {
+		t.Fatalf("expected /confirm prompt, got %+v", bot.sent)
+	}
+
+	pending, err := svc.confirms.Load(120)
+	if err != nil {
+		t.Fatalf("confirms.Load() error = %v", err)
+	}
+	if strings.TrimSpace(pending.GoalID) == "" {
+		t.Fatal("expected pending goal id for confirmation")
+	}
+}
+
+func TestHandleUpdateConfirmReplaysPendingCodexGoal(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "done"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+			DataDir:           t.TempDir(),
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
+
+	if err := svc.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 121},
+			Text: "reboot the host",
+		},
+	}); err != nil {
+		t.Fatalf("HandleUpdate(host-critical) error = %v", err)
+	}
+	if len(proxy.calls) != 0 {
+		t.Fatalf("expected no proxy calls before confirmation, got %d", len(proxy.calls))
+	}
+
+	if err := svc.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 2,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 121},
+			Text: "/confirm",
+		},
+	}); err != nil {
+		t.Fatalf("HandleUpdate(/confirm) error = %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(proxy.calls) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(proxy.calls) != 1 {
+		t.Fatalf("expected pending request to replay after /confirm, got %d calls", len(proxy.calls))
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[0].text), "/confirm") {
+		t.Fatalf("expected first bot message to request /confirm, got %q", bot.sent[0].text)
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[1].text), "confirmed") {
+		t.Fatalf("expected second bot message to acknowledge confirmation, got %q", bot.sent[1].text)
+	}
+	if _, err := svc.confirms.Load(121); err == nil {
+		t.Fatal("expected pending confirmation to be cleared")
 	}
 }
 

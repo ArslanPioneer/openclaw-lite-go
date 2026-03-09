@@ -16,6 +16,7 @@ type SessionState struct {
 	ActiveGoalID           string    `json:"active_goal_id,omitempty"`
 	LastCodexResultSummary string    `json:"last_codex_result_summary,omitempty"`
 	LastActivity           time.Time `json:"last_activity,omitempty"`
+	PendingConfirmation    bool      `json:"pending_confirmation,omitempty"`
 }
 
 type SessionStore struct {

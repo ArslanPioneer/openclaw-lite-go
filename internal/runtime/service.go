@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"openclaw-lite-go/internal/codexproxy"
 	"openclaw-lite-go/internal/config"
 	"openclaw-lite-go/internal/memory"
 	"openclaw-lite-go/internal/skills"
@@ -51,22 +52,23 @@ type CodexProxy interface {
 }
 
 type Service struct {
-	cfg    config.Config
-	bot    TelegramClient
-	agent  AgentClient
-	offset int64
-	health *HealthState
-	store  *memory.Store
+	cfg      config.Config
+	bot      TelegramClient
+	agent    AgentClient
+	offset   int64
+	health   *HealthState
+	store    *memory.Store
 	sessions *SessionStore
-	goals *GoalStore
-	runner *GoalRunner
-	tools  ToolExecutor
-	skills *skills.Manager
-	codex  CodexProxy
+	goals    *GoalStore
+	confirms *ConfirmStore
+	runner   *GoalRunner
+	tools    ToolExecutor
+	skills   *skills.Manager
+	codex    CodexProxy
 
-	mu            sync.RWMutex
-	activeModel   map[int64]string
-	chatMode      map[int64]executionMode
+	mu          sync.RWMutex
+	activeModel map[int64]string
+	chatMode    map[int64]executionMode
 
 	dedupMu sync.Mutex
 	seen    map[int64]struct{}
@@ -85,18 +87,19 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 		)
 	}
 	svc := &Service{
-		cfg:           cfg,
-		bot:           bot,
-		agent:         agent,
-		store:         memStore,
-		sessions:      NewSessionStore(memStore.DataDir()),
-		goals:         NewGoalStore(memStore.DataDir()),
-		tools:         tools.NewExecutor(12*time.Second, skillManager),
-		skills:        skillManager,
-		codex:         codexProxy,
-		activeModel:   make(map[int64]string),
-		chatMode:      make(map[int64]executionMode),
-		seen:          make(map[int64]struct{}),
+		cfg:         cfg,
+		bot:         bot,
+		agent:       agent,
+		store:       memStore,
+		sessions:    NewSessionStore(memStore.DataDir()),
+		goals:       NewGoalStore(memStore.DataDir()),
+		confirms:    NewConfirmStore(memStore.DataDir()),
+		tools:       tools.NewExecutor(12*time.Second, skillManager),
+		skills:      skillManager,
+		codex:       codexProxy,
+		activeModel: make(map[int64]string),
+		chatMode:    make(map[int64]executionMode),
+		seen:        make(map[int64]struct{}),
 	}
 	svc.runner = NewGoalRunner(&serviceGoalStepExecutor{service: svc}, svc.goals, svc.sessions, bot, nil)
 	return svc
@@ -222,7 +225,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 
 	chatID := msg.Chat.ID
 	if strings.HasPrefix(text, "/start") {
-		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /codex to switch to Codex model. Use /agentmode legacy|codex to switch execution mode. Use /codexcli on|off as a compatibility alias. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
+		return s.bot.SendMessage(ctx, chatID, "ClawLite started. Send a message to chat. Use /agent <model> to switch model. Use /codex to switch to Codex model. Use /agentmode legacy|codex to switch execution mode. Use /codexcli on|off as a compatibility alias. Use /confirm to approve pending host-critical codex actions. Use /skills to list installable skills. Use /price <ticker> for direct stock quote. Use /version to see build version.")
 	}
 	if strings.HasPrefix(text, "/version") {
 		return s.bot.SendMessage(ctx, chatID, "ClawLite version: "+BuildVersionString())
@@ -245,6 +248,9 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	}
 	if strings.HasPrefix(text, "/goalstop") {
 		return s.handleGoalStopCommand(ctx, chatID)
+	}
+	if strings.HasPrefix(text, "/confirm") {
+		return s.handleConfirmCommand(ctx, chatID)
 	}
 	if strings.HasPrefix(text, "/goals") {
 		return s.handleGoalsCommand(ctx, chatID)
@@ -274,6 +280,43 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 			})
 			return s.bot.SendMessage(ctx, chatID, "Codex goal runner is unavailable. Please retry.")
 		}
+		risk := codexproxy.ClassifyRisk(text)
+		if risk == codexproxy.RiskLevelHostCritical {
+			if s.confirms == nil {
+				s.updateGoal(chatID, goal.ID, GoalResult{
+					Err: fmt.Errorf("confirmation store is not configured"),
+				})
+				return s.bot.SendMessage(ctx, chatID, "Host-critical confirmation flow is unavailable. Please retry.")
+			}
+			pending := PendingConfirmation{
+				GoalID:     goal.ID,
+				RawRequest: text,
+				RiskLevel:  string(risk),
+				CreatedAt:  time.Now().UTC(),
+			}
+			if err := s.confirms.Save(chatID, pending); err != nil {
+				s.updateGoal(chatID, goal.ID, GoalResult{Err: err})
+				return s.bot.SendMessage(ctx, chatID, "Failed to save pending confirmation. Please retry.")
+			}
+			s.updateGoal(chatID, goal.ID, GoalResult{
+				WaitingInput: true,
+				Summary:      "Host-critical action pending explicit /confirm.",
+			})
+			s.recordSessionActivity(chatID, func(state *SessionState) {
+				state.PendingConfirmation = true
+				state.LastActivity = time.Now().UTC()
+			})
+			return s.bot.SendMessage(ctx, chatID, "Host-critical request detected. Reply /confirm to continue.")
+		}
+		if s.confirms != nil {
+			if err := s.confirms.Clear(chatID); err != nil && s.health != nil {
+				s.health.RecordPollError(fmt.Errorf("clear pending confirmation failed: %w", err))
+			}
+		}
+		s.recordSessionActivity(chatID, func(state *SessionState) {
+			state.PendingConfirmation = false
+			state.LastActivity = time.Now().UTC()
+		})
 		s.updateGoal(chatID, goal.ID, GoalResult{Summary: "queued for background execution"})
 		if err := s.runner.Enqueue(chatID, goal.ID); err != nil {
 			s.updateGoal(chatID, goal.ID, GoalResult{Err: err})
@@ -931,9 +974,50 @@ func (s *Service) handleGoalStopCommand(ctx context.Context, chatID int64) error
 	}
 	s.recordSessionActivity(chatID, func(state *SessionState) {
 		state.ActiveGoalID = ""
+		state.PendingConfirmation = false
 		state.LastActivity = time.Now().UTC()
 	})
+	if s.confirms != nil {
+		if err := s.confirms.Clear(chatID); err != nil && s.health != nil {
+			s.health.RecordPollError(fmt.Errorf("clear pending confirmation failed: %w", err))
+		}
+	}
 	return s.bot.SendMessage(ctx, chatID, "Active goal stopped.")
+}
+
+func (s *Service) handleConfirmCommand(ctx context.Context, chatID int64) error {
+	if s.confirms == nil {
+		return s.bot.SendMessage(ctx, chatID, "Confirmation store is unavailable.")
+	}
+	pending, err := s.confirms.Load(chatID)
+	if errors.Is(err, ErrPendingConfirmationNotFound) {
+		return s.bot.SendMessage(ctx, chatID, "No pending host-critical request to confirm.")
+	}
+	if err != nil {
+		return s.bot.SendMessage(ctx, chatID, "Failed to load pending confirmation. Please retry.")
+	}
+	if err := s.confirms.Clear(chatID); err != nil {
+		return s.bot.SendMessage(ctx, chatID, "Failed to clear pending confirmation. Please retry.")
+	}
+	s.recordSessionActivity(chatID, func(state *SessionState) {
+		state.PendingConfirmation = false
+		state.LastActivity = time.Now().UTC()
+	})
+	if s.runner == nil {
+		s.updateGoal(chatID, pending.GoalID, GoalResult{
+			Err: fmt.Errorf("goal runner is not configured"),
+		})
+		return s.bot.SendMessage(ctx, chatID, "Codex goal runner is unavailable. Please retry.")
+	}
+	if err := s.bot.SendMessage(ctx, chatID, "Confirmed. Goal queued for background execution."); err != nil {
+		return err
+	}
+	s.updateGoal(chatID, pending.GoalID, GoalResult{Summary: "queued for background execution"})
+	if err := s.runner.Enqueue(chatID, pending.GoalID); err != nil {
+		s.updateGoal(chatID, pending.GoalID, GoalResult{Err: err})
+		return s.bot.SendMessage(ctx, chatID, "Failed to queue confirmed goal. Please retry.")
+	}
+	return nil
 }
 
 func (s *Service) loadActiveGoal(chatID int64) (Goal, error) {

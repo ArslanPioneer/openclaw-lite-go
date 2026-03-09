@@ -17,8 +17,8 @@ type PolicyDecision struct {
 }
 
 type Policy struct {
-	DangerFullAccess  bool
-	RequireConfirm    bool
+	DangerFullAccess bool
+	RequireConfirm   bool
 }
 
 func (p Policy) Evaluate(command string) PolicyDecision {
@@ -32,6 +32,10 @@ func (p Policy) Evaluate(command string) PolicyDecision {
 		Allowed:              allowed,
 		RequiresConfirmation: allowed && p.RequireConfirm && risk == RiskLevelHostCritical,
 	}
+}
+
+func ClassifyRisk(command string) RiskLevel {
+	return classifyRisk(command)
 }
 
 func classifyRisk(command string) RiskLevel {

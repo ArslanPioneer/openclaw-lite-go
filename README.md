@@ -92,6 +92,7 @@ go run ./cmd/clawlite run --config ./config.json
 - `/goal`: show the active goal for the current chat
 - `/goals`: list recent goals for the current chat
 - `/goalstop`: stop the active goal for the current chat
+- `/confirm`: approve the pending host-critical codex action for this chat
 - `/price <ticker>`: direct stock quote (example: `/price NVDA`)
 - `/skills`: list installable skills from `runtime.skills_source_dir`
 - `/skills installed`: list installed skills from `runtime.skills_install_dir`
@@ -190,6 +191,7 @@ Then in Telegram:
 - `/codexcli on|off` remains available as a migration alias
 - current/latest questions trigger an explicit research prefetch so Codex can answer with sources
 - host-critical command text is risk-classified for audit/policy handling in full-access mode
+- host-critical actions are paused and require explicit `/confirm` before execution continues
 - if the Codex proxy is missing, the bot now asks for explicit `/agentmode legacy` instead of silently falling back
 
 ### Codex Proxy Deployment (Ubuntu + `codex login --device-auth`)

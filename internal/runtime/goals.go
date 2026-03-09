@@ -33,10 +33,11 @@ type Goal struct {
 }
 
 type GoalResult struct {
-	Running bool
-	Done    bool
-	Summary string
-	Err     error
+	Running      bool
+	WaitingInput bool
+	Done         bool
+	Summary      string
+	Err          error
 }
 
 type GoalStore struct {
@@ -63,6 +64,11 @@ func ApplyGoalResult(goal Goal, result GoalResult) Goal {
 	}
 	if result.Running {
 		goal.Status = GoalStatusRunning
+	}
+	if result.WaitingInput {
+		goal.Status = goalStatusWaitingInput
+		goal.LastError = ""
+		return goal
 	}
 	if result.Err != nil {
 		goal.Status = GoalStatusBlocked

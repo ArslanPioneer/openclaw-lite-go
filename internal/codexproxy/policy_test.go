@@ -28,3 +28,21 @@ func TestPolicyFlagsDangerousCommandsButAllowsConfiguredExecution(t *testing.T) 
 		}
 	}
 }
+
+func TestPolicyHostCriticalRequiresConfirmationWhenEnabled(t *testing.T) {
+	policy := Policy{
+		DangerFullAccess: true,
+		RequireConfirm:   true,
+	}
+
+	decision := policy.Evaluate("rm -rf /")
+	if decision.Risk != RiskLevelHostCritical {
+		t.Fatalf("Risk = %q, want %q", decision.Risk, RiskLevelHostCritical)
+	}
+	if !decision.Allowed {
+		t.Fatal("expected host-critical command to remain allowed in full-access mode")
+	}
+	if !decision.RequiresConfirmation {
+		t.Fatal("expected host-critical command to require confirmation")
+	}
+}
