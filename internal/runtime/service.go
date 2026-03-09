@@ -328,7 +328,7 @@ func (e *serviceGoalStepExecutor) ExecuteGoalStep(ctx context.Context, goal Goal
 		return GoalStep{}, fmt.Errorf("codex proxy is not configured")
 	}
 
-	reply, err := s.codex.Chat(ctx, goal.ChatID, goal.Objective)
+	reply, err := s.codex.Chat(ctx, goal.ChatID, formatGoalProxyMessage(goal, goal.Objective))
 	if err != nil {
 		return GoalStep{}, err
 	}
@@ -368,6 +368,17 @@ func parseCodexGoalStep(reply string) GoalStep {
 	default:
 		return GoalStep{Status: GoalStatusDone, Message: text}
 	}
+}
+
+func formatGoalProxyMessage(goal Goal, message string) string {
+	text := strings.TrimSpace(message)
+	if text == "" {
+		text = strings.TrimSpace(goal.Objective)
+	}
+	if strings.TrimSpace(goal.ID) == "" {
+		return text
+	}
+	return fmt.Sprintf("[goal:%s] %s", strings.TrimSpace(goal.ID), text)
 }
 
 func (s *Service) handlePriceCommand(ctx context.Context, chatID int64, text string) error {

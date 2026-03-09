@@ -238,8 +238,11 @@ func TestHandleUpdateCodexCLIProxyModeRoutesMessagesToProxy(t *testing.T) {
 	if len(proxy.calls) != 1 {
 		t.Fatalf("expected 1 codex proxy call, got %d", len(proxy.calls))
 	}
-	if proxy.calls[0].message != "please refactor this function" {
+	if !strings.Contains(proxy.calls[0].message, "please refactor this function") {
 		t.Fatalf("unexpected proxy message: %q", proxy.calls[0].message)
+	}
+	if !strings.HasPrefix(proxy.calls[0].message, "[goal:") {
+		t.Fatalf("expected goal marker in proxy message, got %q", proxy.calls[0].message)
 	}
 	if len(agent.calls) != 0 {
 		t.Fatalf("expected agent to be bypassed, got %d calls", len(agent.calls))
@@ -533,6 +536,62 @@ func TestHandleUpdateGoalRunnerCompletionUpdatesTelegramAndGoalState(t *testing.
 	}
 	if !strings.Contains(goal.LatestSummary, "codex goal completed") {
 		t.Fatalf("goal summary = %q", goal.LatestSummary)
+	}
+}
+
+func TestHandleUpdateCodexProxyRequestCarriesGoalMarker(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "done"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+			DataDir:           t.TempDir(),
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
+
+	if err := svc.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 88},
+			Text: "inspect host status",
+		},
+	}); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(proxy.calls) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(proxy.calls) != 1 {
+		t.Fatalf("expected 1 proxy call, got %d", len(proxy.calls))
+	}
+
+	session, err := svc.sessions.Load(88)
+	if err != nil {
+		t.Fatalf("sessions.Load() error = %v", err)
+	}
+	if strings.TrimSpace(session.ActiveGoalID) == "" {
+		t.Fatal("expected active goal id")
+	}
+
+	wantPrefix := "[goal:" + session.ActiveGoalID + "] "
+	if !strings.HasPrefix(proxy.calls[0].message, wantPrefix) {
+		t.Fatalf("expected proxy message prefix %q, got %q", wantPrefix, proxy.calls[0].message)
+	}
+	if !strings.Contains(proxy.calls[0].message, "inspect host status") {
+		t.Fatalf("expected original objective in proxy message, got %q", proxy.calls[0].message)
 	}
 }
 

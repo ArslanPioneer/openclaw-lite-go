@@ -56,3 +56,36 @@ func TestAuditLogCapturesPromptAndReplyMetadata(t *testing.T) {
 		t.Fatalf("ExecutionMode = %q, want full-auto", record.ExecutionMode)
 	}
 }
+
+func TestAuditLogCapturesGoalIDFromRuntimePropagatedMessage(t *testing.T) {
+	workdir := t.TempDir()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	server := NewServer(Config{
+		WorkDir:  workdir,
+		StateDir: stateDir,
+		Executor: &fakeExecutor{reply: []byte(`{"reply":"done"}`)},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/chat", bytes.NewBufferString(`{"chat_id":99,"message":"[goal:runtime-goal-9] inspect disk usage"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	records, err := NewAuditLog(stateDir).ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	if records[0].GoalID != "runtime-goal-9" {
+		t.Fatalf("GoalID = %q, want runtime-goal-9", records[0].GoalID)
+	}
+	if records[0].RawUserMessage != "[goal:runtime-goal-9] inspect disk usage" {
+		t.Fatalf("RawUserMessage = %q", records[0].RawUserMessage)
+	}
+}
