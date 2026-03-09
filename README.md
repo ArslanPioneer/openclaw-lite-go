@@ -186,6 +186,10 @@ If you run a Codex middleware service on VPS, configure:
 }
 ```
 
+If `clawlite` itself runs inside Docker but `codexproxy` runs on the VPS host via `systemd`,
+use `http://host.docker.internal:8099/chat` instead of `127.0.0.1`, and keep the
+`docker-compose.yml` host-gateway mapping enabled.
+
 Then in Telegram:
 - normal chat messages route to the Codex middleware by default
 - `/agentmode legacy` to return one chat to the legacy agent path
@@ -289,6 +293,7 @@ WantedBy=multi-user.target
 - persistent config mount: `./data -> /app/data`
 - optional skills source mount: `./openclaw-skills -> /app/openclaw-skills` (read-only)
 - optional Docker socket mount: `/var/run/docker.sock -> /var/run/docker.sock` (read-only)
+- host gateway alias: `host.docker.internal -> host-gateway` so the container can reach host-side `codexproxy`
 - health endpoint: `http://127.0.0.1:18080/healthz`
 
 ### Windows (PowerShell)
@@ -344,6 +349,7 @@ Deployment behavior:
 - If `/opt/openclaw-lite-go` is not a git repo, it backs up the old directory and clones from GitHub.
 - Preserves `data/` and `.codexproxy/` from backup when recreating directory.
 - Stops/disables legacy `openclaw-lite-go.service` to avoid host port `18080` conflicts.
+- Migrates legacy `codex_proxy_url=http://127.0.0.1:8099/chat` to `http://host.docker.internal:8099/chat` for Docker-based bot deployments.
 - Runs `docker compose up -d --build --remove-orphans --force-recreate`.
 
 ## Performance Notes

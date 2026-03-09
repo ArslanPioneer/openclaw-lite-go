@@ -70,6 +70,9 @@ jobs:
             fi
 
             cd "${REPO_DIR}"
+            if [ -f "${REPO_DIR}/data/config.json" ]; then
+              sed -i 's#http://127\.0\.0\.1:8099/chat#http://host.docker.internal:8099/chat#g' "${REPO_DIR}/data/config.json"
+            fi
             export APP_VERSION="$(date -u +%Y%m%d.%H%M%S)"
             export APP_COMMIT="$(git rev-parse --short HEAD)"
 
