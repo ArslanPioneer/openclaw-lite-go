@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"openclaw-lite-go/internal/config"
 	"openclaw-lite-go/internal/runtime"
@@ -17,22 +19,54 @@ import (
 type evalCase struct {
 	Name              string   `json:"name"`
 	Mode              string   `json:"mode,omitempty"`
+	PreInputs         []string `json:"pre_inputs,omitempty"`
 	Input             string   `json:"input"`
+	WaitForCompletion bool     `json:"wait_for_completion,omitempty"`
 	ExpectContains    []string `json:"expect_contains"`
 	ExpectNotContains []string `json:"expect_not_contains"`
 }
 
 type evalBot struct {
-	sent []string
+	mu      sync.Mutex
+	updates []telegram.Update
+	next    int
+	sent    []string
 }
 
-func (b *evalBot) GetUpdates(_ context.Context, _ int64, _ int) ([]telegram.Update, error) {
-	return nil, nil
+func (b *evalBot) GetUpdates(ctx context.Context, offset int64, _ int) ([]telegram.Update, error) {
+	b.mu.Lock()
+	if b.next < len(b.updates) {
+		update := b.updates[b.next]
+		b.next++
+		b.mu.Unlock()
+		if update.UpdateID >= offset {
+			return []telegram.Update{update}, nil
+		}
+		return nil, nil
+	}
+	b.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(50 * time.Millisecond):
+		return nil, nil
+	}
 }
 
 func (b *evalBot) SendMessage(_ context.Context, _ int64, text string) error {
+	b.mu.Lock()
 	b.sent = append(b.sent, text)
+	b.mu.Unlock()
 	return nil
+}
+
+func (b *evalBot) SentSnapshot() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, len(b.sent))
+	copy(out, b.sent)
+	return out
 }
 
 type evalAgent struct{}
@@ -152,15 +186,38 @@ func runCase(idx int, c evalCase) (string, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	bot := &evalBot{}
+	chatID := int64(1000 + idx)
+	updates := make([]telegram.Update, 0, len(c.PreInputs)+1)
+	nextUpdateID := int64(idx*100 + 1)
+	for _, pre := range c.PreInputs {
+		updates = append(updates, telegram.Update{
+			UpdateID: nextUpdateID,
+			Message: &telegram.Message{
+				Chat: telegram.Chat{ID: chatID},
+				Text: pre,
+			},
+		})
+		nextUpdateID++
+	}
+	updates = append(updates, telegram.Update{
+		UpdateID: nextUpdateID,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: chatID},
+			Text: c.Input,
+		},
+	})
+
+	bot := &evalBot{updates: updates}
 	agent := &evalAgent{}
 	cfg := config.Config{
 		Agent: config.AgentConfig{
 			Model: "gpt-4o-mini",
 		},
 		Runtime: config.RuntimeConfig{
-			DataDir:      tmpDir,
-			HistoryTurns: 8,
+			DataDir:           tmpDir,
+			HistoryTurns:      8,
+			Workers:           1,
+			PollTimeoutSecond: 1,
 		},
 	}
 	if strings.EqualFold(strings.TrimSpace(c.Mode), "codex_first") {
@@ -173,20 +230,76 @@ func runCase(idx int, c evalCase) (string, error) {
 		svc.SetCodexProxy(&evalCodexProxy{})
 	}
 
-	update := telegram.Update{
-		UpdateID: int64(idx + 1),
-		Message: &telegram.Message{
-			Chat: telegram.Chat{ID: int64(1000 + idx)},
-			Text: c.Input,
-		},
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.Run(runCtx)
+	}()
+
+	var (
+		output  string
+		waitErr error
+	)
+	if c.WaitForCompletion {
+		output, waitErr = waitForCompletionOutput(bot)
+	} else {
+		output, waitErr = waitForAnyOutput(bot)
 	}
-	if err := svc.HandleUpdate(context.Background(), update); err != nil {
-		return "", err
+	if waitErr != nil {
+		return "", waitErr
 	}
-	if len(bot.sent) == 0 {
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+	}
+	return output, nil
+}
+
+func waitForAnyOutput(bot *evalBot) (string, error) {
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		sent := bot.SentSnapshot()
+		if len(sent) > 0 {
+			return sent[0], nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return "", fmt.Errorf("no bot output")
+}
+
+func waitForCompletionOutput(bot *evalBot) (string, error) {
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		sent := bot.SentSnapshot()
+		if len(sent) > 0 {
+			last := sent[len(sent)-1]
+			if !isTransientEvalMessage(last) {
+				return last, nil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	sent := bot.SentSnapshot()
+	if len(sent) == 0 {
 		return "", fmt.Errorf("no bot output")
 	}
-	return bot.sent[len(bot.sent)-1], nil
+	return sent[len(sent)-1], nil
+}
+
+func isTransientEvalMessage(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if strings.Contains(lower, "goal queued") {
+		return true
+	}
+	if strings.Contains(lower, "reply /confirm to continue") {
+		return true
+	}
+	if strings.Contains(lower, "confirmed. goal queued") {
+		return true
+	}
+	return false
 }
 
 func validateCaseOutput(output string, c evalCase) error {

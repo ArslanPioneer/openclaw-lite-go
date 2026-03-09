@@ -1,34 +1,78 @@
 [
   {
-    "name": "codex_first_service_health",
+    "name": "codex_first_queue_ack",
     "mode": "codex_first",
     "input": "inspect the clawlite service status on this vps",
     "expect_contains": [
-      "healthy"
+      "queued"
     ]
   },
   {
-    "name": "codex_first_disk_usage",
+    "name": "codex_first_background_completion",
+    "mode": "codex_first",
+    "input": "inspect the clawlite service status on this vps",
+    "wait_for_completion": true,
+    "expect_contains": [
+      "healthy"
+    ],
+    "expect_not_contains": [
+      "queued"
+    ]
+  },
+  {
+    "name": "codex_first_disk_usage_completion",
     "mode": "codex_first",
     "input": "inspect disk usage on this vps",
+    "wait_for_completion": true,
     "expect_contains": [
       "disk"
+    ],
+    "expect_not_contains": [
+      "queued"
     ]
   },
   {
-    "name": "codex_first_latest_research",
+    "name": "codex_first_latest_research_completion",
     "mode": "codex_first",
     "input": "what is the latest ai news today?",
+    "wait_for_completion": true,
     "expect_contains": [
       "sources:"
+    ],
+    "expect_not_contains": [
+      "queued"
     ]
   },
   {
-    "name": "codex_first_repo_task",
+    "name": "codex_first_repo_task_completion",
     "mode": "codex_first",
     "input": "inspect this repo and complete a multi-step codex-first runtime review",
+    "wait_for_completion": true,
     "expect_contains": [
       "codex"
+    ],
+    "expect_not_contains": [
+      "queued"
+    ]
+  },
+  {
+    "name": "codex_first_host_critical_requires_confirm",
+    "mode": "codex_first",
+    "input": "reboot the host",
+    "expect_contains": [
+      "/confirm"
+    ]
+  },
+  {
+    "name": "codex_first_confirm_resumes_saved_request",
+    "mode": "codex_first",
+    "pre_inputs": [
+      "reboot the host"
+    ],
+    "input": "/confirm",
+    "wait_for_completion": true,
+    "expect_contains": [
+      "codex-first eval handled the request"
     ]
   }
 ]
