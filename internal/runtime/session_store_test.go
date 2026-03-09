@@ -38,6 +38,12 @@ func TestSessionStorePersistsCodexModeAcrossRestart(t *testing.T) {
 	restartedBot := &fakeBot{}
 	restartedSvc := NewService(cfg, restartedBot, restartedAgent)
 	restartedSvc.SetCodexProxy(restartedProxy)
+	if restartedSvc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go restartedSvc.runner.Run(ctx)
 
 	if err := restartedSvc.HandleUpdate(context.Background(), telegram.Update{
 		UpdateID: 2,
@@ -47,6 +53,13 @@ func TestSessionStorePersistsCodexModeAcrossRestart(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("restarted HandleUpdate(chat) error = %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(restartedProxy.calls) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	if len(restartedProxy.calls) != 1 {

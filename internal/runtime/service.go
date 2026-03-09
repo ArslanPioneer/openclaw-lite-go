@@ -84,7 +84,7 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 			time.Duration(cfg.Runtime.CodexProxyTimeout)*time.Second,
 		)
 	}
-	return &Service{
+	svc := &Service{
 		cfg:           cfg,
 		bot:           bot,
 		agent:         agent,
@@ -98,6 +98,8 @@ func NewService(cfg config.Config, bot TelegramClient, agent AgentClient) *Servi
 		chatMode:      make(map[int64]executionMode),
 		seen:          make(map[int64]struct{}),
 	}
+	svc.runner = NewGoalRunner(&serviceGoalStepExecutor{service: svc}, svc.goals, svc.sessions, bot, nil)
+	return svc
 }
 
 func (s *Service) SetToolExecutor(exec ToolExecutor) {
@@ -258,16 +260,26 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 	if err != nil {
 		return err
 	}
-	s.updateGoal(chatID, goal.ID, GoalResult{Running: true, Summary: "started"})
-
-	if s.isCodexPassThru(chatID) && s.codex != nil {
-		return s.handleCodexProxyChat(ctx, chatID, text)
-	}
-	if s.getExecutionMode(chatID) == executionModeCodex && s.codex == nil {
+	mode := s.getExecutionMode(chatID)
+	if mode == executionModeCodex && s.codex == nil {
 		s.updateGoal(chatID, goal.ID, GoalResult{
 			Err: fmt.Errorf("codex proxy is not configured; switch to /agentmode legacy to use the fallback agent"),
 		})
 		return s.bot.SendMessage(ctx, chatID, "Codex execution mode is enabled, but the Codex proxy is not configured. Use /agentmode legacy to run the fallback agent explicitly.")
+	}
+	if mode == executionModeCodex {
+		if s.runner == nil {
+			s.updateGoal(chatID, goal.ID, GoalResult{
+				Err: fmt.Errorf("goal runner is not configured"),
+			})
+			return s.bot.SendMessage(ctx, chatID, "Codex goal runner is unavailable. Please retry.")
+		}
+		s.updateGoal(chatID, goal.ID, GoalResult{Summary: "queued for background execution"})
+		if err := s.runner.Enqueue(chatID, goal.ID); err != nil {
+			s.updateGoal(chatID, goal.ID, GoalResult{Err: err})
+			return s.bot.SendMessage(ctx, chatID, "Failed to queue codex goal. Please retry.")
+		}
+		return s.bot.SendMessage(ctx, chatID, "Goal queued. Running in background.")
 	}
 	if ticker, ok := extractTickerFromStockQuery(text); ok {
 		stockReply, stockErr := s.lookupStockQuote(ctx, ticker)
@@ -280,6 +292,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 		}
 	}
 
+	s.updateGoal(chatID, goal.ID, GoalResult{Running: true, Summary: "started"})
 	model := s.getActiveModel(chatID)
 	prompt := s.buildPromptFromMemory(chatID, text)
 	reply, err := s.runAgentLoop(ctx, prompt, model)
@@ -300,6 +313,61 @@ func (s *Service) HandleUpdate(ctx context.Context, update telegram.Update) erro
 		state.LastActivity = time.Now().UTC()
 	})
 	return s.bot.SendMessage(ctx, chatID, reply)
+}
+
+type serviceGoalStepExecutor struct {
+	service *Service
+}
+
+func (e *serviceGoalStepExecutor) ExecuteGoalStep(ctx context.Context, goal Goal) (GoalStep, error) {
+	if e == nil || e.service == nil {
+		return GoalStep{}, fmt.Errorf("goal step executor is not configured")
+	}
+	s := e.service
+	if s.codex == nil {
+		return GoalStep{}, fmt.Errorf("codex proxy is not configured")
+	}
+
+	reply, err := s.codex.Chat(ctx, goal.ChatID, goal.Objective)
+	if err != nil {
+		return GoalStep{}, err
+	}
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		reply = "Codex proxy returned empty response."
+	}
+
+	if err := s.store.AppendExchange(goal.ChatID, goal.Objective, reply); err != nil && s.health != nil {
+		s.health.RecordPollError(fmt.Errorf("memory append failed: %w", err))
+	}
+	s.recordSessionActivity(goal.ChatID, func(state *SessionState) {
+		state.ExecutionMode = string(executionModeCodex)
+		state.LastCodexResultSummary = summarizeSessionText(reply, 240)
+		state.LastActivity = time.Now().UTC()
+	})
+
+	return parseCodexGoalStep(reply), nil
+}
+
+func parseCodexGoalStep(reply string) GoalStep {
+	text := strings.TrimSpace(reply)
+	if text == "" {
+		return GoalStep{Status: GoalStatusDone, Message: "Codex proxy returned empty response."}
+	}
+
+	lower := strings.ToLower(text)
+	switch {
+	case strings.HasPrefix(lower, "running:"):
+		return GoalStep{Status: GoalStatusRunning, Message: strings.TrimSpace(text[len("running:"):])}
+	case strings.HasPrefix(lower, "blocked:"):
+		return GoalStep{Status: GoalStatusBlocked, Message: strings.TrimSpace(text[len("blocked:"):])}
+	case strings.HasPrefix(lower, "wait_input:"):
+		return GoalStep{Status: goalStatusWaitingInput, Message: strings.TrimSpace(text[len("wait_input:"):])}
+	case strings.HasPrefix(lower, "done:"):
+		return GoalStep{Status: GoalStatusDone, Message: strings.TrimSpace(text[len("done:"):])}
+	default:
+		return GoalStep{Status: GoalStatusDone, Message: text}
+	}
 }
 
 func (s *Service) handlePriceCommand(ctx context.Context, chatID int64, text string) error {

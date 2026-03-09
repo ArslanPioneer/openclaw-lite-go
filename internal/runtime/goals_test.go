@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"openclaw-lite-go/internal/config"
 	"openclaw-lite-go/internal/telegram"
@@ -22,6 +23,12 @@ func TestCreateGoalFromTelegramMessage(t *testing.T) {
 
 	svc := NewService(cfg, &fakeBot{}, &fakeAgent{reply: "should-not-be-called"})
 	svc.SetCodexProxy(&fakeCodexProxy{reply: "deployment looks healthy"})
+	if svc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
 
 	if err := svc.HandleUpdate(context.Background(), telegram.Update{
 		UpdateID: 1,
@@ -52,6 +59,15 @@ func TestCreateGoalFromTelegramMessage(t *testing.T) {
 	}
 	if goal.Objective != "check the deployment health" {
 		t.Fatalf("goal.Objective = %q", goal.Objective)
+	}
+	var loadErr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		goal, loadErr = store.Load(55, session.ActiveGoalID)
+		if loadErr == nil && goal.Status == GoalStatusDone {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if goal.Status != GoalStatusDone {
 		t.Fatalf("goal.Status = %q, want %q", goal.Status, GoalStatusDone)

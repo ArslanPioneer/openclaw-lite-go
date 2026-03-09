@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"openclaw-lite-go/internal/config"
 	"openclaw-lite-go/internal/telegram"
@@ -198,6 +199,12 @@ func TestHandleUpdateCodexCLIProxyModeRoutesMessagesToProxy(t *testing.T) {
 		},
 	}, bot, agent)
 	svc.SetCodexProxy(proxy)
+	if svc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
 
 	enable := telegram.Update{
 		UpdateID: 1,
@@ -220,6 +227,13 @@ func TestHandleUpdateCodexCLIProxyModeRoutesMessagesToProxy(t *testing.T) {
 	if err := svc.HandleUpdate(context.Background(), chat); err != nil {
 		t.Fatalf("HandleUpdate(chat) error = %v", err)
 	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(proxy.calls) >= 1 && len(bot.sent) >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	if len(proxy.calls) != 1 {
 		t.Fatalf("expected 1 codex proxy call, got %d", len(proxy.calls))
@@ -229,6 +243,9 @@ func TestHandleUpdateCodexCLIProxyModeRoutesMessagesToProxy(t *testing.T) {
 	}
 	if len(agent.calls) != 0 {
 		t.Fatalf("expected agent to be bypassed, got %d calls", len(agent.calls))
+	}
+	if len(bot.sent) < 3 || !strings.Contains(strings.ToLower(bot.sent[1].text), "queued") {
+		t.Fatalf("expected queued ack before completion, got %+v", bot.sent)
 	}
 	if got := bot.sent[len(bot.sent)-1].text; got != "codex proxy reply" {
 		t.Fatalf("unexpected bot reply: %q", got)
@@ -284,6 +301,12 @@ func TestHandleUpdateCodexFirstRoutesNormalChatToCodexProxyByDefault(t *testing.
 		},
 	}, bot, agent)
 	svc.SetCodexProxy(proxy)
+	if svc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
 
 	update := telegram.Update{
 		UpdateID: 1,
@@ -295,12 +318,22 @@ func TestHandleUpdateCodexFirstRoutesNormalChatToCodexProxyByDefault(t *testing.
 	if err := svc.HandleUpdate(context.Background(), update); err != nil {
 		t.Fatalf("HandleUpdate() error = %v", err)
 	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(proxy.calls) >= 1 && len(bot.sent) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	if len(proxy.calls) != 1 {
 		t.Fatalf("expected 1 codex proxy call, got %d", len(proxy.calls))
 	}
 	if len(agent.calls) != 0 {
 		t.Fatalf("expected agent to be bypassed, got %d calls", len(agent.calls))
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[0].text), "queued") {
+		t.Fatalf("expected queued acknowledgement, got %q", bot.sent[0].text)
 	}
 	if got := bot.sent[len(bot.sent)-1].text; got != "codex default reply" {
 		t.Fatalf("unexpected bot reply: %q", got)
@@ -382,6 +415,124 @@ func TestLegacyAgentPathOnlyRunsWhenExplicitlyRequested(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(bot.sent[0].text), "/agentmode legacy") {
 		t.Fatalf("expected explicit fallback instruction, got %q", bot.sent[0].text)
+	}
+}
+
+func TestHandleUpdateCodexFirstEnqueuesGoalRunnerInsteadOfRunningSynchronously(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "proxy completed"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	if svc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 66},
+			Text: "inspect the deployment health",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	if len(agent.calls) != 0 {
+		t.Fatalf("expected legacy agent to stay idle, got %d calls", len(agent.calls))
+	}
+	if len(proxy.calls) != 0 {
+		t.Fatalf("expected codex proxy not to run synchronously, got %d calls", len(proxy.calls))
+	}
+	if got := len(svc.runner.queue); got != 1 {
+		t.Fatalf("expected queued goal count = 1, got %d", got)
+	}
+	if len(bot.sent) != 1 {
+		t.Fatalf("expected 1 acknowledgement message, got %d", len(bot.sent))
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[0].text), "queued") {
+		t.Fatalf("expected queued acknowledgement, got %q", bot.sent[0].text)
+	}
+}
+
+func TestHandleUpdateGoalRunnerCompletionUpdatesTelegramAndGoalState(t *testing.T) {
+	bot := &fakeBot{}
+	agent := &fakeAgent{reply: "should-not-be-called"}
+	proxy := &fakeCodexProxy{reply: "codex goal completed"}
+	svc := NewService(config.Config{
+		Agent: config.AgentConfig{Model: "gpt-4o-mini"},
+		Runtime: config.RuntimeConfig{
+			CodexProxyURL:     "http://127.0.0.1:8099/chat",
+			CodexFirstDefault: true,
+			DataDir:           t.TempDir(),
+		},
+	}, bot, agent)
+	svc.SetCodexProxy(proxy)
+
+	if svc.runner == nil {
+		t.Fatal("expected default goal runner to be attached")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.runner.Run(ctx)
+
+	update := telegram.Update{
+		UpdateID: 1,
+		Message: &telegram.Message{
+			Chat: telegram.Chat{ID: 67},
+			Text: "perform codex-first health check",
+		},
+	}
+	if err := svc.HandleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("HandleUpdate() error = %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(proxy.calls) >= 1 && len(bot.sent) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if len(proxy.calls) != 1 {
+		t.Fatalf("expected 1 proxy call from runner, got %d", len(proxy.calls))
+	}
+	if len(bot.sent) < 2 {
+		t.Fatalf("expected queued + completion messages, got %d", len(bot.sent))
+	}
+	if !strings.Contains(strings.ToLower(bot.sent[0].text), "queued") {
+		t.Fatalf("expected first message to be queued ack, got %q", bot.sent[0].text)
+	}
+	if bot.sent[len(bot.sent)-1].text != "codex goal completed" {
+		t.Fatalf("expected completion message, got %q", bot.sent[len(bot.sent)-1].text)
+	}
+
+	state, err := svc.sessions.Load(67)
+	if err != nil {
+		t.Fatalf("sessions.Load() error = %v", err)
+	}
+	if strings.TrimSpace(state.ActiveGoalID) == "" {
+		t.Fatal("expected active goal id to be persisted")
+	}
+	goal, err := svc.goals.Load(67, state.ActiveGoalID)
+	if err != nil {
+		t.Fatalf("goals.Load() error = %v", err)
+	}
+	if goal.Status != GoalStatusDone {
+		t.Fatalf("goal status = %q, want %q", goal.Status, GoalStatusDone)
+	}
+	if !strings.Contains(goal.LatestSummary, "codex goal completed") {
+		t.Fatalf("goal summary = %q", goal.LatestSummary)
 	}
 }
 
