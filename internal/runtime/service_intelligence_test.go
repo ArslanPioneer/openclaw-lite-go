@@ -252,12 +252,18 @@ func TestHandleUpdateRecoversFromMalformedToolCall(t *testing.T) {
 		},
 	}
 	svc := NewService(cfg, bot, agent)
+	svc.tools = &fakeToolExecutor{
+		run: func(callName string, query string) (string, error) {
+			t.Fatalf("unexpected tool call during malformed tool-call recovery: %s %s", callName, query)
+			return "", nil
+		},
+	}
 
 	if err := svc.HandleUpdate(context.Background(), telegram.Update{
 		UpdateID: 1,
 		Message: &telegram.Message{
 			Chat: telegram.Chat{ID: 606},
-			Text: "nvda price",
+			Text: "research nvidia",
 		},
 	}); err != nil {
 		t.Fatalf("HandleUpdate() error = %v", err)
