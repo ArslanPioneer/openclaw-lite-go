@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Client struct {
@@ -40,6 +43,13 @@ type apiResponse struct {
 	Description string          `json:"description"`
 }
 
+var (
+	headingLinePattern       = regexp.MustCompile(`^\s{0,3}#{1,6}\s+(.+?)\s*$`)
+	unorderedListLinePattern = regexp.MustCompile(`^\s*[-*+]\s+(.+?)\s*$`)
+	orderedListLinePattern   = regexp.MustCompile(`^\s*(\d+)\.\s+(.+?)\s*$`)
+	blockquoteLinePattern    = regexp.MustCompile(`^\s*>\s?(.*)$`)
+)
+
 func NewClient(token string, timeout time.Duration) *Client {
 	return &Client{
 		token:   strings.TrimSpace(token),
@@ -66,17 +76,18 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSecond int
 }
 
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
-	markdownPayload := map[string]any{
+	rendered := renderTelegramHTML(text)
+	htmlPayload := map[string]any{
 		"chat_id":    chatID,
-		"text":       escapeMarkdownV2(text),
-		"parse_mode": "MarkdownV2",
+		"text":       rendered,
+		"parse_mode": "HTML",
 	}
 	var ignored map[string]any
-	err := c.call(ctx, "sendMessage", markdownPayload, &ignored)
+	err := c.call(ctx, "sendMessage", htmlPayload, &ignored)
 	if err == nil {
 		return nil
 	}
-	if !isMarkdownEntityParseError(err) {
+	if !isTelegramParseError(err) {
 		return err
 	}
 
@@ -87,7 +98,7 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) err
 	return c.call(ctx, "sendMessage", payload, &ignored)
 }
 
-func isMarkdownEntityParseError(err error) bool {
+func isTelegramParseError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -95,20 +106,189 @@ func isMarkdownEntityParseError(err error) bool {
 	return strings.Contains(lower, "parse entities")
 }
 
-func escapeMarkdownV2(text string) string {
+func renderTelegramHTML(text string) string {
 	if text == "" {
 		return ""
 	}
-	var b strings.Builder
-	b.Grow(len(text) + 8)
-	for _, r := range text {
-		switch r {
-		case '\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!':
-			b.WriteByte('\\')
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	rendered := make([]string, 0, len(lines))
+
+	inCodeBlock := false
+	codeLines := make([]string, 0)
+	quoteLines := make([]string, 0)
+
+	flushCodeBlock := func() {
+		if !inCodeBlock {
+			return
 		}
-		b.WriteRune(r)
+		codeText := strings.Join(codeLines, "\n")
+		if len(codeLines) > 0 {
+			codeText += "\n"
+		}
+		rendered = append(rendered, "<pre><code>"+html.EscapeString(codeText)+"</code></pre>")
+		codeLines = codeLines[:0]
+		inCodeBlock = false
+	}
+
+	flushQuoteBlock := func() {
+		if len(quoteLines) == 0 {
+			return
+		}
+		parts := make([]string, 0, len(quoteLines))
+		for _, line := range quoteLines {
+			parts = append(parts, renderInlineMarkdown(line))
+		}
+		rendered = append(rendered, "<blockquote>"+strings.Join(parts, "\n")+"</blockquote>")
+		quoteLines = quoteLines[:0]
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			flushQuoteBlock()
+			if inCodeBlock {
+				flushCodeBlock()
+			} else {
+				inCodeBlock = true
+				codeLines = codeLines[:0]
+			}
+			continue
+		}
+		if inCodeBlock {
+			codeLines = append(codeLines, line)
+			continue
+		}
+		if match := blockquoteLinePattern.FindStringSubmatch(line); match != nil {
+			quoteLines = append(quoteLines, match[1])
+			continue
+		}
+		flushQuoteBlock()
+
+		switch {
+		case trimmed == "":
+			rendered = append(rendered, "")
+		case headingLinePattern.MatchString(line):
+			match := headingLinePattern.FindStringSubmatch(line)
+			rendered = append(rendered, "<b>"+renderInlineMarkdown(match[1])+"</b>")
+		case unorderedListLinePattern.MatchString(line):
+			match := unorderedListLinePattern.FindStringSubmatch(line)
+			rendered = append(rendered, "&#8226; "+renderInlineMarkdown(match[1]))
+		case orderedListLinePattern.MatchString(line):
+			match := orderedListLinePattern.FindStringSubmatch(line)
+			rendered = append(rendered, match[1]+". "+renderInlineMarkdown(match[2]))
+		default:
+			rendered = append(rendered, renderInlineMarkdown(line))
+		}
+	}
+
+	flushQuoteBlock()
+	flushCodeBlock()
+
+	return strings.Join(rendered, "\n")
+}
+
+func renderInlineMarkdown(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(text) + 16)
+	for i := 0; i < len(text); {
+		switch {
+		case text[i] == '`':
+			if segment, width, ok := wrapInlineSpan(text[i+1:], "`", "code", false); ok {
+				b.WriteString("<code>" + html.EscapeString(segment) + "</code>")
+				i += width + 1
+				continue
+			}
+		case strings.HasPrefix(text[i:], "["):
+			if rendered, width, ok := renderInlineLink(text[i:]); ok {
+				b.WriteString(rendered)
+				i += width
+				continue
+			}
+		case strings.HasPrefix(text[i:], "**"):
+			if segment, width, ok := wrapInlineSpan(text[i+2:], "**", "b", true); ok {
+				b.WriteString("<b>" + renderInlineMarkdown(segment) + "</b>")
+				i += width + 2
+				continue
+			}
+		case strings.HasPrefix(text[i:], "__"):
+			if segment, width, ok := wrapInlineSpan(text[i+2:], "__", "b", true); ok {
+				b.WriteString("<b>" + renderInlineMarkdown(segment) + "</b>")
+				i += width + 2
+				continue
+			}
+		case strings.HasPrefix(text[i:], "~~"):
+			if segment, width, ok := wrapInlineSpan(text[i+2:], "~~", "s", true); ok {
+				b.WriteString("<s>" + renderInlineMarkdown(segment) + "</s>")
+				i += width + 2
+				continue
+			}
+		case strings.HasPrefix(text[i:], "||"):
+			if segment, width, ok := wrapInlineSpan(text[i+2:], "||", "tg-spoiler", true); ok {
+				b.WriteString("<tg-spoiler>" + renderInlineMarkdown(segment) + "</tg-spoiler>")
+				i += width + 2
+				continue
+			}
+		case text[i] == '*':
+			if segment, width, ok := wrapInlineSpan(text[i+1:], "*", "i", true); ok {
+				b.WriteString("<i>" + renderInlineMarkdown(segment) + "</i>")
+				i += width + 1
+				continue
+			}
+		case text[i] == '_':
+			if segment, width, ok := wrapInlineSpan(text[i+1:], "_", "i", true); ok {
+				b.WriteString("<i>" + renderInlineMarkdown(segment) + "</i>")
+				i += width + 1
+				continue
+			}
+		}
+
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 1 {
+			size = 1
+		}
+		b.WriteString(html.EscapeString(text[i : i+size]))
+		i += size
 	}
 	return b.String()
+}
+
+func wrapInlineSpan(text string, marker string, _ string, allowNested bool) (string, int, bool) {
+	end := strings.Index(text, marker)
+	if end <= 0 {
+		return "", 0, false
+	}
+	segment := text[:end]
+	if strings.TrimSpace(segment) == "" {
+		return "", 0, false
+	}
+	if !allowNested && strings.Contains(segment, "\n") {
+		return "", 0, false
+	}
+	return segment, end + len(marker), true
+}
+
+func renderInlineLink(text string) (string, int, bool) {
+	closeLabel := strings.Index(text, "](")
+	if closeLabel <= 1 {
+		return "", 0, false
+	}
+	label := text[1:closeLabel]
+	rest := text[closeLabel+2:]
+	closeURL := strings.Index(rest, ")")
+	if closeURL <= 0 {
+		return "", 0, false
+	}
+	href := strings.TrimSpace(rest[:closeURL])
+	if !strings.HasPrefix(href, "http://") && !strings.HasPrefix(href, "https://") {
+		return "", 0, false
+	}
+	rendered := `<a href="` + html.EscapeString(href) + `">` + renderInlineMarkdown(label) + `</a>`
+	return rendered, closeLabel + 2 + closeURL + 1, true
 }
 
 func (c *Client) call(ctx context.Context, method string, payload any, out any) error {

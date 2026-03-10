@@ -100,7 +100,7 @@ go run ./cmd/clawlite run --config ./config.json
 - `/skills install <skill_name>`: install one skill by name
 - `/version`: show deployed build version and commit
 
-Telegram replies are sent with `MarkdownV2` parse mode by default; if Telegram rejects markdown entities, the bot retries once as plain text automatically.
+Telegram replies are rendered from markdown-ish text into Telegram-safe `HTML` by default; if Telegram rejects the formatted payload, the bot retries once as plain text automatically.
 
 ## Intelligent Minimum Pack
 
